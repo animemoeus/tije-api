@@ -488,4 +488,6 @@ async def _prune_loop(tracker: Tracker) -> None:
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
+# httpx logs every request with the full upstream URL at INFO; keep it out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 app = create_app()
