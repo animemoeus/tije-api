@@ -480,7 +480,10 @@ def test_routes_by_type(client, fake):
     client.get("/routes", params={"type": "BRT"})
     # List and details come from the cache; only the missing route is asked again.
     assert fake.paths()[n:] == ["/v2/route/2"]
-    assert client.get("/routes").status_code == 422
+    # No type: every route, Mikrotrans included.
+    every = client.get("/routes").json()
+    assert every["type"] is None
+    assert "/v2/route/JAK.10" in fake.paths()
 
 
 def test_poll_fields(client, fake):
@@ -559,3 +562,33 @@ def test_health(client):
         "poll_seconds": 0.05,
     }
     assert body["auth"]["mode"] == "guest"
+
+
+def test_routes_type_values(client):
+    assert (
+        client.get("/routes", params={"type": "angkutan umum integrasi"}).json()["type"]
+        == "Angkutan Umum Integrasi"
+    )
+    assert (
+        client.get("/routes", params={"type": "Bus Wisata"}).json()["type"]
+        == "Bus Wisata"
+    )
+    assert client.get("/routes", params={"type": "Kereta"}).status_code == 422
+
+
+def test_route_types(client):
+    types = {t["type"]: t["routes"] for t in client.get("/route-types").json()["types"]}
+    assert types["BRT"] == 3 and types["Mikrotrans"] == 1 and types["Royaltrans"] == 0
+    assert len(types) == 7
+
+
+def test_all_stops(client):
+    body = client.get("/stops/all", params={"type": "BRT"}).json()
+    assert body["type"] == "BRT"
+    ids = [s["stop_id"] for s in body["stops"]]
+    # FakeTJ answers every code with route 1, so the stops are shared and merged once each.
+    assert ids and len(ids) == len(set(ids))
+    assert all(
+        s["routes"] and {"lat", "lon", "name"} <= s.keys() for s in body["stops"]
+    )
+    assert client.get("/stops/all", params={"type": "Kereta"}).status_code == 422

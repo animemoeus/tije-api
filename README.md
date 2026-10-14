@@ -50,7 +50,7 @@ copy .env.example .env   # opsional
 `app/static/index.html` adalah satu file HTML tanpa build step (Leaflet + OpenStreetMap) yang memanggil API ini:
 
 - klik peta atau tombol **Lokasi saya** untuk memilih titik pantau, lalu pilih radius;
-- bus tampil live lewat `WS /ws`, diperbarui tiap detik (marker berwarna sesuai rute, panah menunjukkan arah; bus yang keluar radius hilang), daftar di samping diurutkan dari yang terdekat; klik item untuk membuka marker-nya;
+- bus tampil live lewat `WS /ws`, diperbarui tiap detik (marker berwarna sesuai rute, jejak di belakang bus menunjukkan arah gerak; bus yang keluar radius hilang), daftar di samping diurutkan dari yang terdekat; klik item untuk membuka marker-nya;
 - tombol **Tampilkan halte** memanggil `GET /stops`;
 - koneksi WebSocket otomatis tersambung ulang kalau putus.
 

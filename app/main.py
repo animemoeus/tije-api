@@ -9,8 +9,10 @@ import contextlib
 import logging
 import re
 import time
+from collections import Counter
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import (
     FastAPI,
@@ -28,6 +30,24 @@ from .config import settings as default_settings
 from .routes import normalize_route
 from .tracker import Tracker, parse_routes, route_matches
 from .upstream import TJClient, UpstreamError
+
+
+class RouteType(StrEnum):
+    """Route types as upstream names them in `route_desc`. Matched case-insensitively."""
+
+    BRT = "BRT"
+    ANGKUTAN_UMUM_INTEGRASI = "Angkutan Umum Integrasi"
+    MIKROTRANS = "Mikrotrans"
+    TRANSJABODETABEK = "Transjabodetabek"
+    ROYALTRANS = "Royaltrans"
+    RUSUN = "Rusun"
+    BUS_WISATA = "Bus Wisata"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "RouteType | None":
+        text = str(value).strip().lower()
+        return next((m for m in cls if m.value.lower() == text), None)
+
 
 log = logging.getLogger("tj")
 
@@ -210,29 +230,50 @@ def create_app(
 
         return await cached(request_app, code, fetch)
 
-    @app.get("/routes")
-    async def routes_by_type(
-        request: Request,
-        type: str = Query(
-            ...,
-            description="Route type as upstream names it in route_desc, e.g. BRT, Mikrotrans",
-        ),
-    ) -> dict[str, Any]:
-        """Path and stops of every route of one type, e.g. all BRT corridors. Routes whose detail fails are left out."""
+    async def route_list(request_app: FastAPI) -> list[Any]:
+        """Every route upstream knows (GET /v2/route, no geometry), cached. HTTPException 502 on upstream errors."""
 
-        async def fetch_list() -> list[Any]:
+        async def fetch() -> list[Any]:
             try:
-                return await request.app.state.client.list_routes()
+                return await request_app.state.client.list_routes()
             except UpstreamError as e:
                 raise HTTPException(502, f"upstream error: {e}") from e
 
-        listing = await cached(request.app, "__list__", fetch_list)
-        wanted = type.strip().lower()
+        return await cached(request_app, "__list__", fetch)
+
+    @app.get("/route-types")
+    async def route_types(request: Request) -> dict[str, Any]:
+        """Values accepted by `GET /routes?type=`, with how many routes upstream has of each."""
+        listing = await route_list(request.app)
+        counts = Counter(
+            str(r.get("route_desc") or "").strip().lower()
+            for r in listing
+            if isinstance(r, dict)
+        )
+        return {
+            "types": [
+                {"type": t.value, "routes": counts[t.value.lower()]} for t in RouteType
+            ]
+        }
+
+    TYPE_QUERY = Query(
+        description="Route type as upstream names it in route_desc. Empty = every route"
+    )
+
+    async def routes_of(
+        request_app: FastAPI, type: RouteType | None
+    ) -> list[dict[str, Any]]:
+        """Normalized routes of one type (every route when None), sorted by code. Routes whose detail fails are left out."""
+        listing = await route_list(request_app)
+        wanted = type.value.lower() if type else None
         codes = [
             str(r.get("route_short_name") or r.get("route_id"))
             for r in listing
             if isinstance(r, dict)
-            and str(r.get("route_desc") or "").strip().lower() == wanted
+            and (
+                wanted is None
+                or str(r.get("route_desc") or "").strip().lower() == wanted
+            )
             and (r.get("route_short_name") or r.get("route_id"))
         ]
         limit = asyncio.Semaphore(5)
@@ -240,15 +281,46 @@ def create_app(
         async def one(code: str) -> dict[str, Any] | None:
             async with limit:
                 try:
-                    return await get_route(request.app, code)
+                    return await get_route(request_app, code)
                 except HTTPException as e:
                     log.warning("route %s skipped: %s", code, e.detail)
                     return None
 
         found = [r for r in await asyncio.gather(*map(one, codes)) if r]
+        return sorted(found, key=lambda r: _natural_key(str(r["route_code"])))
+
+    @app.get("/routes")
+    async def routes_by_type(
+        request: Request,
+        type: Annotated[RouteType | None, TYPE_QUERY] = None,
+    ) -> dict[str, Any]:
+        """Path and stops of every route of one type (e.g. all BRT corridors), or of every route when `type` is empty.
+
+        Routes whose detail fails are left out."""
         return {
-            "type": type.strip(),
-            "routes": sorted(found, key=lambda r: _natural_key(str(r["route_code"]))),
+            "type": type.value if type else None,
+            "routes": await routes_of(request.app, type),
+        }
+
+    @app.get("/stops/all")
+    async def all_stops(
+        request: Request,
+        type: Annotated[RouteType | None, TYPE_QUERY] = None,
+    ) -> dict[str, Any]:
+        """Every stop served by routes of one type (every route when `type` is empty), one entry per `stop_id`.
+
+        Built from route details, since upstream has no "all stops" endpoint. `routes` lists the codes stopping there."""
+        stops: dict[str, dict[str, Any]] = {}
+        for route in await routes_of(request.app, type):
+            for d in route["directions"]:
+                for st in d["stops"]:
+                    key = str(st.get("stop_id") or f"{st['lat']},{st['lon']}")
+                    entry = stops.setdefault(key, {**st, "routes": []})
+                    if route["route_code"] not in entry["routes"]:
+                        entry["routes"].append(route["route_code"])
+        return {
+            "type": type.value if type else None,
+            "stops": sorted(stops.values(), key=lambda s: str(s.get("name") or "")),
         }
 
     @app.get("/routes/{route_code}")

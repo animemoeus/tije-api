@@ -472,11 +472,54 @@ Upstream membatasi hasil 20 halte per permintaan (`meta.limit = 20`).
 
 ---
 
+## `GET /stops/all`
+
+Semua halte dari rute satu jenis, atau dari semua rute kalau `type` dikosongkan. Upstream tidak punya endpoint semua halte (`GET /v2/bus-stop` maksimal 20 halte per permintaan), jadi daftar ini disusun dari detail rute yang sama dengan `GET /routes` dan ikut cache-nya.
+
+**Parameter query**: `type` (opsional), nilainya sama dengan `GET /routes`. Nilai di luar daftar dijawab `422`.
+
+Halte yang dilewati beberapa rute muncul sekali per `stop_id`, dengan kode rutenya di `routes`. Hasil diurutkan menurut nama halte. Permintaan pertama tanpa `type` lama karena backend mengambil detail ke-237 rute.
+
+**Respons**
+
+```json
+{
+  "type": "BRT",
+  "stops": [
+    { "stop_id": "...", "name": "...", "lat": -6.2, "lon": 106.8, "type": "...", "routes": ["1", "9"] }
+  ]
+}
+```
+
+Nilai di contoh hanya ilustrasi.
+
+---
+
+## `GET /route-types`
+
+Daftar nilai yang diterima `GET /routes?type=`, beserta jumlah rute tiap jenis menurut upstream. Datanya dari `GET /v2/route` yang sama dengan `GET /routes`, jadi ikut cache `TJ_ROUTE_CACHE_SECONDS`. Jenis yang sedang tidak punya rute tetap muncul dengan `routes: 0`.
+
+**Respons**
+
+```json
+{
+  "types": [
+    { "type": "BRT", "routes": 30 },
+    { "type": "Angkutan Umum Integrasi", "routes": 0 },
+    { "type": "Mikrotrans", "routes": 0 }
+  ]
+}
+```
+
+Contoh dipotong; respons asli berisi ketujuh jenis. Angka selain BRT di contoh ini hanya ilustrasi.
+
+---
+
 ## `GET /routes`
 
-Jalur semua rute dengan satu jenis, misalnya semua koridor BRT. Dipakai UI untuk selalu menggambar koridor BRT.
+Jalur semua rute dengan satu jenis, misalnya semua koridor BRT, atau semua rute kalau `type` dikosongkan. Dipakai UI untuk selalu menggambar koridor BRT.
 
-**Parameter query**: `type` (wajib), jenis rute seperti di `route_desc` upstream: `BRT`, `Mikrotrans`, `Angkutan Umum Integrasi`, `Transjabodetabek`, `Rusun`, `Royaltrans`, `Bus Wisata`. Tidak peka huruf besar-kecil.
+**Parameter query**: `type` (opsional), jenis rute seperti di `route_desc` upstream: `BRT`, `Mikrotrans`, `Angkutan Umum Integrasi`, `Transjabodetabek`, `Rusun`, `Royaltrans`, `Bus Wisata`. Tidak peka huruf besar-kecil. Nilai di luar daftar ini dijawab `422`. Tanpa `type`, semua rute dikembalikan dan `type` di respons bernilai `null`. Permintaan pertama tanpa `type` jauh lebih lama karena backend mengambil detail ke-237 rute.
 
 Backend mengambil daftar rute dari `GET /v2/route` (237 rute, 30 di antaranya BRT), lalu detail setiap rute yang cocok dari `GET /v2/route/{code}`, paling banyak 5 sekaligus. Daftar dan detail di-cache selama `TJ_ROUTE_CACHE_SECONDS`. Permintaan pertama untuk BRT butuh sekitar 2 detik; setelah itu dijawab dari cache. Rute yang detailnya gagal diambil dilewati dan dicatat di log.
 
