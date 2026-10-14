@@ -20,7 +20,7 @@ Peringatan `StarletteDeprecationWarning` tentang `httpx2` berasal dari `TestClie
 Semua test ada di `tests/test_api.py`.
 
 - **`FakeTJ`** meniru `tijeapi` lewat `httpx.MockTransport`. Ia menerbitkan token (`tok1`, `tok2`, …), menolak request tanpa token valid dengan 401 seperti server asli, dan menyediakan `/v1/auth/login/guest`, `/v1/auth/login` (hanya menerima `me@example.com` / `s3cret`), `/v1/auth/token/refresh`, `/v1/bus/offline`, `/v2/bus-stop`, dan `/v1/user/trips`. Isi `/v1/bus/offline` diatur lewat `fake.offline_buses` dan kode statusnya lewat `fake.offline_status`, jadi test bisa "menggerakkan" bus di tengah jalan. Semua request yang diterima dicatat di `fake.calls`.
-- **`client`** (fixture) membuat aplikasi lengkap lewat `create_app` dan membungkusnya dengan `fastapi.testclient.TestClient`, jadi lifespan, routing, validasi, WebSocket, dan `_poll_loop` ikut dites. Fixture memakai `poll_seconds=0.05` supaya test WebSocket cepat.
+- **`client`** (fixture) membuat aplikasi lengkap lewat `create_app` dan membungkusnya dengan `fastapi.testclient.TestClient`, jadi lifespan, routing, validasi, WebSocket, dan `_poll_loop` ikut dites. Fixture memakai `poll_seconds=0.05` dan `ws_base_seconds=0.05` supaya test WebSocket cepat.
 - **`Settings(_env_file=None, ...)`** dipakai di semua test, jadi file `.env` lokal (misalnya berisi akun pribadi) tidak ikut terbaca dan tidak mengubah hasil test.
 - **`wait_for(ws, cond)`** membaca `snapshot` berturut-turut sampai ada yang memenuhi syarat. Karena `snapshot` dikirim terus dengan jadwal tetap, test tidak bergantung pada waktu yang pas.
 
@@ -37,10 +37,19 @@ Semua test ada di `tests/test_api.py`.
 | `test_snapped_position_and_out_of_order_updates` | Posisi `snap_*` diutamakan; update dengan timestamp lebih lama diabaikan |
 | `test_bus_not_found_and_bad_payload` | Item yang bukan objek bus diabaikan oleh `ingest`; bus tak dikenal → 404 |
 | `test_validation_and_upstream_errors` | Koordinat London → 422; upstream 500 → 502 di `/buses/offline` dan `/buses`; WebSocket menerima pesan `error` |
-| `test_radius_capped_at_max` | Radius 80 dipotong ke 50, dan upstream hanya menerima radius 50 |
+| `test_radius_capped_at_max` | Radius 80 dipotong ke 30, dan upstream hanya menerima radius 30 |
 | `test_route_filter` | `routes= 4, 4d ` hanya mengembalikan jalur 4 dan 4D; `routes_available` urut alami dengan jumlah benar |
 | `test_websocket_route_filter` | WebSocket dengan `routes=4D,4` hanya mengirim jalur itu, tidak peka huruf besar-kecil, termasuk bus yang baru muncul di polling berikutnya |
-| `test_websocket_sends_snapshot_every_interval` | WebSocket mengirim `snapshot` berulang sesuai `poll_seconds` (tidak beruntun tanpa jeda), hanya bus dalam radius dengan `distance_km`; bus yang bergerak, baru muncul, atau keluar radius terlihat di `snapshot` berikutnya; `ws_clients` kembali 0 setelah client putus |
+| `test_websocket_hz` | Tanpa `hz` (bawaan 2) mengirim sekitar 2 kali lebih banyak `snapshot` daripada `hz=1`, dan `hz=4` setidaknya 3 kali lebih banyak, dalam waktu yang sama; jumlah polling upstream mengikuti `poll_seconds`, bukan `hz` |
+| `test_websocket_rejects_hz_not_dividing_ticks` | `hz` 0, 3, dan 5 ditolak saat handshake dengan kode 1008 |
+| `test_diff_sends_only_changed_fields` | `_diff`: bus bergerak hanya mengirim field yang berubah, bus diam tidak dikirim, bus baru utuh, bus hilang masuk `remove`; `_delta_view` membuang `age_seconds` dan membulatkan posisi |
+| `test_delta_client_too_far_behind_gets_a_snapshot` | Antrean yang sudah `DELTA_BACKLOG` diganti satu `snapshot` |
+| `test_websocket_delta_mode` | `mode=delta`: pesan pertama `snapshot` tanpa `age_seconds`, bus yang bergerak hanya mengirim perubahan, bus diam tidak pernah dikirim, bus baru utuh, bus yang keluar radius masuk `remove` |
+| `test_websocket_delta_shares_diff_between_clients` | Dua client delta dengan filter yang sama hanya memicu satu `_diff` per tick; `ws_clients` menghitung client delta |
+| `test_websocket_rejects_unknown_mode` | `mode=foo` ditolak saat handshake dengan kode 1008 |
+| `test_websocket_work_is_shared_between_clients` | Tiga client di area yang sama (dua tanpa filter, satu dengan filter jalur) hanya memicu satu `buses_near` per tick |
+| `test_tracker_interpolates_between_polls` | Posisi baru digeser bertahap dari posisi lama, `raw_latitude` langsung berisi posisi baru; lompatan jauh langsung ditaruh di tempat baru; posisi yang sama tidak memulai ulang interpolasi |
+| `test_websocket_sends_snapshot_every_interval` | WebSocket mengirim `snapshot` berulang sesuai `ws_base_seconds` (tidak beruntun tanpa jeda), hanya bus dalam radius dengan `distance_km`; bus yang bergerak, baru muncul, atau keluar radius terlihat di `snapshot` berikutnya; `ws_clients` kembali 0 setelah client putus |
 | `test_stops_passthrough` | `/stops` meneruskan `data` dari `/v2/bus-stop` |
 | `test_poll_fields` | `/buses` berisi data `/v1/bus/offline`; `next_stop_name`, `prev_stop_name`, `trip_headsign`, dan `source` benar |
 | `test_account_login_used_and_trips_available` | Login akun dipakai, `/account/trips` 200, `/account` menunjukkan `user`, password tidak muncul di `/health` |

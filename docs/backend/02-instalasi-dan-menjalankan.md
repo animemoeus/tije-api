@@ -77,7 +77,7 @@ Saat startup server belum menghubungi TransJakarta. Login baru terjadi pada requ
 2026-10-13 20:53:49,102 INFO httpx: HTTP Request: POST https://tijeapi.transjakarta.co.id/v1/bus/offline "HTTP/1.1 200 OK"
 ```
 
-Selama ada client WebSocket yang tersambung, baris `POST .../v1/bus/offline` muncul sekali per detik untuk setiap area yang dipantau.
+Request ke upstream tidak ditulis ke log. Logger `httpx` dinaikkan ke WARNING supaya alamat upstream tidak muncul. Untuk melihat apakah polling berjalan, cek `GET /health` (`tracker.areas`, `tracker.ws_clients`) atau `age_seconds` pada bus.
 
 Hentikan server dengan `Ctrl+C`.
 

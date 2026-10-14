@@ -154,30 +154,41 @@ sequenceDiagram
     participant API
     participant TR as Tracker
     participant P as _poll_loop
+    participant B as _broadcast_loop
 
-    C->>API: WS /ws?lat&lon&radius_km
+    C->>API: WS /ws?lat&lon&radius_km&hz
     API->>C: accept
     API->>API: track_area(...) seperti alur 2
     alt polling pertama gagal
         API->>C: {"type": "error", "detail": "..."}
         API->>C: close 1011
     else berhasil
-        API->>API: area.subscribers += 1
-        loop setiap TJ_POLL_SECONDS, jadwal tetap
-            API->>TR: buses_near(lat, lon, radius, routes)
-            API->>C: {"type": "snapshot", "buses": [...]}
-        end
+        API->>C: snapshot pertama
+        API->>API: daftarkan client ke area.clients
         par di latar belakang
             P->>TR: ingest(posisi dari /v1/bus/offline) tiap TJ_POLL_SECONDS
+        and setiap tick (TJ_WS_BASE_SECONDS / 4)
+            B->>TR: buses_near(area), sekali per area
+            B->>B: json.dumps sekali per filter jalur
+            B->>API: taruh frame di slot client yang jatuh tempo
+            API->>C: {"type": "snapshot", "buses": [...]}
         end
     end
     C--xAPI: tutup koneksi
-    API->>API: area.subscribers -= 1
+    API->>API: hapus client dari area.clients
 ```
 
-Setiap koneksi WebSocket punya dua tugas: satu membaca dari client hanya untuk mengetahui kapan koneksi putus, satu lagi mengirim `snapshot`. Pengiriman memakai jadwal tetap (`next_at += poll_seconds`), jadi waktu yang dipakai untuk mengirim pesan besar tidak menggeser interval.
+Setiap koneksi WebSocket punya dua tugas kecil: satu membaca dari client hanya untuk mengetahui kapan koneksi putus, satu lagi menunggu frame baru di slot miliknya lalu mengirimnya.
 
-Pengiriman `snapshot` tidak menunggu polling. Handler hanya membaca isi Tracker, yang diperbarui oleh `_poll_loop` secara terpisah. Setiap client menyaring sendiri berdasarkan titik, radius, dan filter jalur miliknya, jadi client di Blok M tidak menerima bus di Kota.
+Isi `snapshot` dihitung oleh satu tugas latar, `_broadcast_loop`. Setiap tick (0,25 detik dengan bawaan) tugas ini memeriksa client mana yang jatuh tempo: client `hz=4` setiap tick, `hz=2` setiap 2 tick, `hz=1` setiap 4 tick. Untuk setiap area yang punya client jatuh tempo, `buses_near` dipanggil sekali, lalu hasilnya disaring dan di-encode ke JSON sekali per filter jalur. String yang sama dipakai untuk semua client dengan filter itu, jadi menambah client di area yang sama hanya menambah biaya kirim.
+
+Slot setiap client hanya menyimpan frame terbaru. Kalau client lambat dan frame sebelumnya belum terkirim, frame itu ditimpa. Client lambat tidak menahan `_broadcast_loop` ataupun client lain.
+
+Client `mode=delta` dikelompokkan per area berdasarkan filter jalur dan `hz`. Setiap kelompok menyimpan state terakhir yang sudah dikirim. Di setiap tick, `_broadcast_loop` membandingkan state itu dengan hasil `buses_near` yang sudah dihitung untuk area tersebut. Perbedaannya di-encode sekali, lalu dikirim ke semua client di kelompok itu. Client baru menerima `snapshot` dari state kelompok, jadi delta berikutnya pasti cocok dengan data yang dipegangnya.
+
+Pesan delta tidak boleh terlewat, jadi client delta memakai antrean, bukan slot. Kalau antrean melewati 8 pesan, isinya diganti satu `snapshot` dari state terbaru. Memori per client tetap terbatas, dan `_broadcast_loop` tidak pernah menunggu client.
+
+Jadwal tick tetap (`next_at += tick`), jadi waktu yang dipakai untuk menghitung tidak menggeser interval. Pengiriman tidak menunggu polling: `_broadcast_loop` hanya membaca Tracker, yang diperbarui `_poll_loop` secara terpisah. Di antara dua polling, Tracker menggeser posisi bus sedikit demi sedikit (lihat [interpolasi posisi](04-referensi-api.md#interpolasi-posisi)), jadi `snapshot` dengan `hz=4` tetap menunjukkan gerakan.
 
 ## 4. Polling di latar belakang
 
@@ -202,7 +213,7 @@ flowchart TD
 
 Polling semua area yang jatuh tempo berjalan paralel. Area yang polling sebelumnya belum selesai (penanda `busy`) dilewati, jadi area yang lambat tidak menumpuk request dan tidak menunda area lain. Hasil polling masuk ke Tracker lewat `ingest`, dan sampai ke client lewat `snapshot` berikutnya.
 
-Bebannya ke upstream: satu request per detik untuk setiap area yang punya client WebSocket (dengan `TJ_POLL_SECONDS=1`). Client yang memilih titik dan radius yang sama berbagi satu polling.
+Bebannya ke upstream: dua request per detik untuk setiap area yang punya client WebSocket (dengan `TJ_POLL_SECONDS=0.5`). Client yang memilih titik dan radius yang sama berbagi satu polling, dan `hz` tidak menambah polling.
 
 ## 5. Bus diperbarui, kedaluwarsa, dan dibersihkan
 

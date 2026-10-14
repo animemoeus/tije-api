@@ -6,13 +6,14 @@ Docs: http://localhost:8000/docs
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
 from collections import Counter
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import (
     FastAPI,
@@ -51,6 +52,11 @@ class RouteType(StrEnum):
 
 log = logging.getLogger("tj")
 
+# WebSocket snapshots go out on ticks of ws_base_seconds / WS_TICKS; `hz` must divide it.
+WS_TICKS = 4
+# A mode=delta client with more unsent frames than this is behind: its queue becomes one fresh snapshot.
+DELTA_BACKLOG = 8
+
 # Jakarta-ish bounds, to reject obviously wrong coordinates early.
 LAT = {"ge": -7.5, "le": -5.5}
 LON = {"ge": 106.0, "le": 107.5}
@@ -65,12 +71,13 @@ def create_app(
     async def lifespan(app: FastAPI):
         app.state.client = client or TJClient(settings)
         app.state.tracker = tracker or Tracker(settings.bus_expiry_seconds)
-        # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled", "subscribers", "busy"}
+        # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled", "clients", "groups", "busy"}
         app.state.areas = {}
         app.state.routes = {}  # route code -> (fetched_at, normalized route)
         tasks = [
             asyncio.create_task(_prune_loop(app.state.tracker)),
             asyncio.create_task(_poll_loop(app, settings)),
+            asyncio.create_task(_broadcast_loop(app, settings)),
         ]
         yield
         for t in tasks:
@@ -98,7 +105,10 @@ def create_app(
                 "lon": lon,
                 "r": radius_km,
                 "polled": 0.0,
-                "subscribers": 0,
+                "clients": [],
+                # mode=delta clients, grouped so each group's diff is computed once:
+                # (routes, every) -> {"routes", "every", "state", "clients"}
+                "groups": {},
                 "busy": False,
             },
         )
@@ -133,8 +143,9 @@ def create_app(
             "tracker": {
                 **request.app.state.tracker.stats(),
                 "areas": len(areas),
-                "ws_clients": sum(a["subscribers"] for a in areas),
+                "ws_clients": sum(_ws_count(a) for a in areas),
                 "poll_seconds": settings.poll_seconds,
+                "ws_base_seconds": settings.ws_base_seconds,
             },
         }
 
@@ -364,8 +375,18 @@ def create_app(
         lon: float = Query(..., **LON),
         radius_km: float | None = Query(None, gt=0),
         routes: str | None = Query(None),
+        hz: int = Query(
+            2, ge=1, le=WS_TICKS, description="Snapshots per second: 1, 2 or 4"
+        ),
+        mode: Literal["snapshot", "delta"] = Query(
+            "snapshot",
+            description="snapshot: every bus every time. delta: one snapshot, then only what changed",
+        ),
     ) -> None:
-        """Every `poll_seconds` (default 1 s): all buses near a point, nearest first. `routes=4,4D` filters by route."""
+        """`hz` snapshots per second (default 2): all buses near a point, nearest first. `routes=4,4D` filters by route."""
+        if WS_TICKS % hz:
+            await websocket.close(code=1008)
+            return
         r = radius_param(radius_km)
         wanted = parse_routes(routes)
         await websocket.accept()
@@ -376,7 +397,41 @@ def create_app(
             await websocket.send_json({"type": "error", "detail": e.detail})
             await websocket.close(code=1011)
             return
-        entry["subscribers"] += 1
+        every = WS_TICKS // hz
+        if mode == "delta":
+            # Start from the state the group's next delta is computed against, so this client is in sync.
+            key = (frozenset(wanted) if wanted else None, every)
+            group = entry["groups"].get(key)
+            if group is None:
+                state = {
+                    b["bus_body_no"]: _delta_view(b)
+                    for b in tracker.buses_near(
+                        entry["lat"], entry["lon"], entry["r"], wanted
+                    )
+                }
+                group = entry["groups"][key] = {
+                    "routes": wanted,
+                    "every": every,
+                    "state": state,
+                    "clients": [],
+                }
+            # _broadcast_loop appends to "queue"; delta frames cannot be skipped.
+            me = {
+                "queue": [_snapshot(list(group["state"].values()))],
+                "ready": asyncio.Event(),
+            }
+            group["clients"].append(me)
+        else:
+            # _broadcast_loop fills "frame"; only the newest frame is kept,
+            # so a slow client skips frames instead of holding up the others.
+            me = {
+                "routes": wanted,
+                "every": every,
+                "frame": _snapshot(tracker.buses_near(lat, lon, r, wanted)),
+                "ready": asyncio.Event(),
+            }
+            entry["clients"].append(me)
+        me["ready"].set()
 
         async def read() -> None:
             # Nothing is expected from the client; this only notices when it goes away.
@@ -384,18 +439,15 @@ def create_app(
                 pass
 
         async def send() -> None:
-            loop = asyncio.get_running_loop()
-            next_at = loop.time()
             while True:
-                entry["last"] = time.monotonic()
-                await websocket.send_json(
-                    {
-                        "type": "snapshot",
-                        "buses": tracker.buses_near(lat, lon, r, wanted),
-                    }
-                )
-                next_at += settings.poll_seconds
-                await asyncio.sleep(max(0.0, next_at - loop.time()))
+                await me["ready"].wait()
+                me["ready"].clear()
+                if mode == "delta":
+                    frames, me["queue"] = me["queue"], []
+                    for frame in frames:
+                        await websocket.send_text(frame)
+                else:
+                    await websocket.send_text(me["frame"])
 
         tasks = [asyncio.create_task(read()), asyncio.create_task(send())]
         try:
@@ -403,7 +455,12 @@ def create_app(
         finally:
             for t in tasks:
                 t.cancel()
-            entry["subscribers"] -= 1
+            if mode == "delta":
+                group["clients"].remove(me)
+                if not group["clients"]:
+                    del entry["groups"][key]
+            else:
+                entry["clients"].remove(me)
 
     return app
 
@@ -466,7 +523,7 @@ async def _poll_loop(app: FastAPI, settings: Settings) -> None:
         now = time.monotonic()
         due = []
         for key, entry in list(app.state.areas.items()):
-            if entry["subscribers"] > 0:
+            if _ws_count(entry):
                 if now - entry["polled"] >= settings.poll_seconds * 0.9:
                     due.append(entry)
             elif now - entry["last"] > settings.area_idle_seconds:
@@ -477,6 +534,109 @@ async def _poll_loop(app: FastAPI, settings: Settings) -> None:
                 task = asyncio.create_task(_poll_quietly(app, entry))
                 running.add(task)
                 task.add_done_callback(running.discard)
+
+
+def _snapshot(buses: list[dict[str, Any]]) -> str:
+    return json.dumps({"type": "snapshot", "buses": buses})
+
+
+def _ws_count(entry: dict[str, Any]) -> int:
+    return len(entry["clients"]) + sum(
+        len(g["clients"]) for g in entry["groups"].values()
+    )
+
+
+def _delta_view(bus: dict[str, Any]) -> dict[str, Any]:
+    """A bus as mode=delta sends it: no age_seconds (changes every frame; received_at replaces it),
+    and lat/lon rounded to ~0.1 m so interpolation float noise is not a change."""
+    out = {k: v for k, v in bus.items() if k != "age_seconds"}
+    for k in ("latitude", "longitude"):
+        if out.get(k) is not None:
+            out[k] = round(out[k], 6)
+    return out
+
+
+def _diff(
+    prev: dict[str, dict[str, Any]], new: dict[str, dict[str, Any]]
+) -> dict[str, list[Any]]:
+    """Per-field changes from prev to new (both bus_body_no -> bus). New buses are sent whole."""
+    upsert = []
+    for no, bus in new.items():
+        old = prev.get(no)
+        if old is None:
+            upsert.append(bus)
+            continue
+        changed = {k: v for k, v in bus.items() if old.get(k) != v}
+        if changed:
+            upsert.append({"bus_body_no": no, **changed})
+    return {"upsert": upsert, "remove": [no for no in prev if no not in new]}
+
+
+def _push(client: dict[str, Any], frame: str, resync: Any) -> None:
+    """Queue a delta frame; a client too far behind gets one snapshot (from resync()) instead."""
+    if len(client["queue"]) >= DELTA_BACKLOG:
+        client["queue"] = [resync()]
+    else:
+        client["queue"].append(frame)
+    client["ready"].set()
+
+
+async def _broadcast_loop(app: FastAPI, settings: Settings) -> None:
+    """Push frames to every WebSocket client.
+
+    Work is done once per area (buses_near), once per route filter (snapshot JSON) and once
+    per delta group (diff + JSON), then the same string goes to every client that wants it,
+    so clients add almost no load.
+    """
+    loop = asyncio.get_running_loop()
+    tick_seconds = settings.ws_base_seconds / WS_TICKS
+    next_at = loop.time()
+    tick = 0
+    while True:
+        # Fixed schedule: time spent encoding does not shift the interval.
+        next_at += tick_seconds
+        await asyncio.sleep(max(0.0, next_at - loop.time()))
+        tick += 1
+        for entry in list(app.state.areas.values()):
+            due = [c for c in entry["clients"] if tick % c["every"] == 0]
+            groups = [g for g in entry["groups"].values() if tick % g["every"] == 0]
+            if not due and not groups:
+                continue
+            entry["last"] = time.monotonic()
+            everything = app.state.tracker.buses_near(
+                entry["lat"], entry["lon"], entry["r"]
+            )
+            frames: dict[frozenset[str] | None, str] = {}
+            for c in due:
+                key = frozenset(c["routes"]) if c["routes"] else None
+                if key not in frames:
+                    frames[key] = _snapshot(
+                        [b for b in everything if route_matches(b, c["routes"])]
+                    )
+                c["frame"] = frames[key]
+                c["ready"].set()
+            for g in groups:
+                new = {
+                    b["bus_body_no"]: _delta_view(b)
+                    for b in everything
+                    if route_matches(b, g["routes"])
+                }
+                d = _diff(g["state"], new)
+                g["state"] = new
+                if not d["upsert"] and not d["remove"]:
+                    continue  # nothing changed: send nothing
+                frame = json.dumps({"type": "delta", **d})
+                snap: list[
+                    str
+                ] = []  # built at most once, only if some client needs a resync
+
+                def resync(new=new, snap=snap) -> str:
+                    if not snap:
+                        snap.append(_snapshot(list(new.values())))
+                    return snap[0]
+
+                for c in g["clients"]:
+                    _push(c, frame, resync)
 
 
 async def _prune_loop(tracker: Tracker) -> None:

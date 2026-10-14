@@ -12,7 +12,7 @@ Dokumentasi interaktif yang dibuat otomatis oleh FastAPI ada di `/docs` (Swagger
 | Autentikasi client | Tidak ada. Siapa pun yang bisa menjangkau server bisa memanggil API. Lihat [11-pengembangan-lanjut.md](11-pengembangan-lanjut.md) kalau server dibuka ke internet |
 | CORS | Semua origin, method, dan header diizinkan |
 | Koordinat | `lat` harus di antara -7.5 dan -5.5, `lon` di antara 106.0 dan 107.5 |
-| Radius | `radius_km` harus lebih dari 0. Kosong berarti 1 km. Nilai di atas 50 (`TJ_MAX_RADIUS_KM`) dipotong menjadi 50 |
+| Radius | `radius_km` harus lebih dari 0. Kosong berarti 1 km. Nilai di atas 30 (`TJ_MAX_RADIUS_KM`) dipotong menjadi 30 |
 | Filter jalur | `routes` berisi kode jalur dipisah koma, misalnya `4,4D,JAK.10`. Cocok persis, tidak peka huruf besar-kecil (`4d` = `4D`). `4` tidak ikut mencocokkan `4D` |
 | Waktu | `age_seconds` dalam detik. `valid_until` berupa unix timestamp (detik) |
 
@@ -93,8 +93,8 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
 | `route_color` | string | upstream | Warna rute dalam hex tanpa `#` |
 | `route_text_color` | string | upstream | Warna teks di atas warna rute |
 | `type` | string | turunan | `BRT`, `Mikrotrans`, atau `Non-BRT`. Nilai upstream selain BRT dan Mikrotrans (misalnya `Angkutan Umum Integrasi`, `Royaltrans`) menjadi `Non-BRT`, sama seperti di app |
-| `latitude`, `longitude` | number | turunan | Posisi yang dipakai. Kalau upstream mengirim posisi yang sudah ditempelkan ke jalur (`snap_latitude`/`snap_longitude`), nilai itu yang dipakai |
-| `raw_latitude`, `raw_longitude` | number | upstream | Posisi GPS mentah |
+| `latitude`, `longitude` | number | turunan | Posisi yang ditampilkan. Dasarnya posisi dari upstream (yang sudah ditempelkan ke jalur, `snap_latitude`/`snap_longitude`, kalau ada). Saat upstream mengirim posisi baru, backend menggeser nilai ini sedikit demi sedikit dari posisi lama ke posisi baru, jadi pergerakan bus terlihat halus. Lihat [interpolasi posisi](#interpolasi-posisi) |
+| `raw_latitude`, `raw_longitude` | number | upstream | Posisi GPS mentah terakhir dari upstream, tanpa interpolasi |
 | `bearing` | number | upstream | Arah hadap dalam derajat (0 = utara, searah jarum jam) |
 | `speed` | number \| null | upstream | Kecepatan. Dari REST sering bernilai 0 |
 | `timestamp` | string \| number | upstream | Waktu data dari upstream. Dari REST bernilai `"0"` |
@@ -105,6 +105,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
 | `estimated_distance_next_stops` | number \| null | upstream | Jarak ke halte berikutnya dalam meter |
 | `source` | string | backend | Asal data. Saat ini selalu `rest:/v1/bus/offline` |
 | `age_seconds` | number | backend | Sudah berapa detik sejak backend menerima data bus ini |
+| `received_at` | number | backend | Unix timestamp (detik, 1 desimal) saat backend terakhir menerima data yang berbeda untuk bus ini. Selama upstream mengirim data yang sama, nilainya tetap. Di `WS /ws?mode=delta` field ini menggantikan `age_seconds` |
 | `distance_km` | number | backend | Jarak dari titik yang diminta. Tidak ada di `GET /buses/{bus_body_no}` |
 
 Kode halte berawalan `H` untuk halte BRT dan `B` untuk bus stop biasa, contohnya `H00278P` dan `B00790P`.
@@ -138,7 +139,8 @@ curl http://localhost:8000/health
     "buses": 3,
     "areas": 1,
     "ws_clients": 1,
-    "poll_seconds": 1.0
+    "poll_seconds": 0.5,
+    "ws_base_seconds": 1.0
   }
 }
 ```
@@ -149,7 +151,8 @@ curl http://localhost:8000/health
 | `tracker.buses` | Jumlah bus yang sedang disimpan di memori (dari semua area) |
 | `tracker.areas` | Jumlah area yang sedang dikenal backend (punya client WebSocket, atau diminta lewat `/buses` dalam 60 detik terakhir) |
 | `tracker.ws_clients` | Jumlah client WebSocket yang tersambung, dijumlahkan dari semua area |
-| `tracker.poll_seconds` | Interval polling dan pengiriman `snapshot` (`TJ_POLL_SECONDS`) |
+| `tracker.poll_seconds` | Interval polling upstream (`TJ_POLL_SECONDS`) |
+| `tracker.ws_base_seconds` | Jarak antar `snapshot` WebSocket untuk `hz=1` (`TJ_WS_BASE_SECONDS`) |
 
 ---
 
@@ -157,7 +160,7 @@ curl http://localhost:8000/health
 
 Daftar bus di sekitar sebuah titik, diurutkan dari yang terdekat.
 
-Kalau data area itu lebih tua dari `TJ_POLL_SECONDS` (bawaan 1 detik), atau area belum pernah diminta, backend memanggil `POST /v1/bus/offline` saat itu juga sebelum menjawab. Kalau masih segar, misalnya karena ada client WebSocket di area yang sama, backend langsung menjawab dari cache. Area yang hanya diminta lewat `/buses` dilupakan setelah 60 detik tanpa request (`TJ_AREA_IDLE_SECONDS`).
+Kalau data area itu lebih tua dari `TJ_POLL_SECONDS` (bawaan 0,5 detik), atau area belum pernah diminta, backend memanggil `POST /v1/bus/offline` saat itu juga sebelum menjawab. Kalau masih segar, misalnya karena ada client WebSocket di area yang sama, backend langsung menjawab dari cache. Area yang hanya diminta lewat `/buses` dilupakan setelah 60 detik tanpa request (`TJ_AREA_IDLE_SECONDS`).
 
 **Parameter query**
 
@@ -701,21 +704,29 @@ Isinya response asli upstream. Bentuk persisnya tergantung akun dan belum dicata
 
 ## `WS /ws`
 
-Aliran posisi bus untuk satu area. Setelah koneksi diterima, client menerima pesan `snapshot` berisi semua bus di dalam radius, diurutkan dari yang terdekat, lalu `snapshot` baru setiap `TJ_POLL_SECONDS` (bawaan 1 detik) dengan jadwal tetap.
+Aliran posisi bus untuk satu area. Setelah koneksi diterima, client menerima pesan `snapshot` berisi semua bus di dalam radius, diurutkan dari yang terdekat, lalu `snapshot` baru sebanyak `hz` kali per detik dengan jadwal tetap.
 
-**Parameter query**: `lat`, `lon`, `radius_km`, dan `routes`, aturannya sama dengan `/buses`. Dengan `routes`, `snapshot` hanya berisi jalur itu.
+**Parameter query**
+
+| Parameter | Bawaan | Keterangan |
+|---|---|---|
+| `lat`, `lon`, `radius_km`, `routes` | | Aturannya sama dengan `/buses`. Dengan `routes`, `snapshot` hanya berisi jalur itu |
+| `hz` | `2` | Jumlah `snapshot` per detik: `1`, `2`, atau `4`. Nilai lain ditolak saat handshake (kode 1008) |
+| `mode` | `snapshot` | `snapshot`: setiap pesan berisi semua bus. `delta`: satu `snapshot` di awal, lalu hanya perubahan. Lihat [mode delta](#mode-delta). Nilai lain ditolak saat handshake (kode 1008) |
 
 **URL**
 
 ```
 ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5
+ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5&hz=4
+ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5&hz=4&mode=delta
 ```
 
-Selama koneksi terbuka, backend mem-polling `POST /v1/bus/offline` untuk area itu setiap `TJ_POLL_SECONDS`. Semua client di area yang sama (titik dibulatkan ke 3 desimal, radius sama) berbagi satu polling.
+Selama koneksi terbuka, backend mem-polling `POST /v1/bus/offline` untuk area itu setiap `TJ_POLL_SECONDS` (bawaan 0,5 detik, jadi 2 kali per detik). Semua client di area yang sama (titik dibulatkan ke 3 desimal, radius sama) berbagi satu polling, apa pun `hz`-nya.
 
 ### Pesan dari server
 
-**`snapshot`**, dikirim langsung setelah koneksi diterima lalu berulang setiap `TJ_POLL_SECONDS`:
+**`snapshot`**, dikirim langsung setelah koneksi diterima lalu berulang `hz` kali per detik:
 
 ```json
 {
@@ -762,12 +773,66 @@ Selama koneksi terbuka, backend mem-polling `POST /v1/bus/offline` untuk area it
 ### Perilaku yang perlu diketahui
 
 - Setiap `snapshot` adalah daftar lengkap. Bus yang tidak ada di `snapshot` terbaru sudah keluar dari radius (atau sudah lebih dari 5 menit tidak terlihat), jadi client cukup mengganti seluruh datanya dengan isi `snapshot` terakhir. Tidak ada pesan "hapus" terpisah.
-- `snapshot` dikirim dengan jadwal tetap setiap `TJ_POLL_SECONDS`, walaupun tidak ada yang berubah. Bus yang diam tetap dikirim ulang dengan data yang sama.
+- `snapshot` dikirim dengan jadwal tetap, walaupun tidak ada yang berubah. Bus yang diam tetap dikirim ulang dengan data yang sama.
 - Polling upstream untuk area itu berjalan terpisah dari pengiriman `snapshot`. Kalau polling gagal atau lambat, `snapshot` tetap dikirim berisi data terakhir yang ada, dan `age_seconds` setiap bus terus bertambah.
-- Ukuran pesan sebanding dengan jumlah bus di radius. Pada radius 20 km satu `snapshot` berisi sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client.
+- Ukuran pesan sebanding dengan jumlah bus di radius. Pada radius 20 km satu `snapshot` berisi sekitar 2.300 bus, atau 1 sampai 2 MB. Dengan `hz=4` itu berarti 4 sampai 8 MB per detik untuk setiap client.
+- Client yang lambat menerima tidak menahan client lain. Server hanya menyimpan `snapshot` terbaru untuk setiap client; kalau client belum selesai menerima yang sebelumnya, `snapshot` yang terlewat dibuang dan client langsung mendapat yang terbaru.
 - Parameter yang tidak valid membuat handshake ditolak (kode 1008 menurut Starlette) sebelum `snapshot` dikirim.
 - Client tidak perlu mengirim apa pun. Pesan dari client diabaikan.
 - Untuk pindah area, tutup koneksi lalu buka koneksi baru dengan koordinat baru.
+
+### Interpolasi posisi
+
+Upstream di-polling 2 kali per detik, dan posisi sebuah bus di upstream tidak selalu berubah di setiap polling. Supaya `snapshot` dengan `hz=4` tidak berisi lompatan, backend tidak langsung memindahkan `latitude`/`longitude` ke posisi baru. Posisi itu digeser lurus dari posisi yang sedang ditampilkan ke posisi baru, dalam waktu yang sama dengan jarak antara dua perubahan posisi terakhir bus itu (paling lama 5 detik).
+
+- `raw_latitude`/`raw_longitude` selalu berisi posisi terbaru dari upstream. Pakai field ini kalau butuh posisi asli tanpa jeda.
+- Akibatnya `latitude`/`longitude` tertinggal dari posisi terbaru upstream, paling lama satu interval perubahan posisi.
+- Bus yang pertama kali terlihat, atau yang berpindah lebih dari 0,5 km sekaligus (misalnya muncul lagi di tempat lain), langsung ditaruh di posisi barunya tanpa digeser.
+- `distance_km` dan penyaringan radius memakai posisi hasil interpolasi. Ini juga berlaku untuk `GET /buses`.
+
+### Mode delta
+
+Dengan `mode=delta`, server mengirim `snapshot` lengkap sekali di awal. Setelah itu yang dikirim hanya perubahannya:
+
+```json
+{
+  "type": "delta",
+  "upsert": [
+    {"bus_body_no": "MYS-17022", "latitude": -6.195521, "longitude": 106.823187, "distance_km": 0.061},
+    {"bus_body_no": "TJ-0815", "route_code": "4", "latitude": -6.19448, "...": "objek bus lengkap"}
+  ],
+  "remove": ["DMR-240"]
+}
+```
+
+- `upsert` berisi bus baru dan bus yang berubah. Bus baru dikirim sebagai objek lengkap. Untuk bus yang sudah dikenal client, isinya hanya `bus_body_no` dan field yang berubah, biasanya `latitude`, `longitude`, dan `distance_km`.
+- `remove` berisi `bus_body_no` dari bus yang keluar dari radius atau filter, atau sudah kedaluwarsa.
+- Kalau tidak ada yang berubah, server tidak mengirim apa pun. Koneksi tetap hidup lewat ping WebSocket.
+- Objek bus di mode ini tidak punya `age_seconds`, karena nilainya berubah di setiap pesan untuk semua bus. Pakai `received_at`: umur data = waktu sekarang dikurangi `received_at`.
+- `latitude` dan `longitude` dibulatkan ke 6 desimal (sekitar 10 cm).
+- Urutan tidak dikirim. Kalau butuh urutan terdekat, urutkan sendiri berdasarkan `distance_km`.
+- Kalau client tertinggal lebih dari 8 pesan (misalnya koneksinya lambat), antreannya dibuang dan diganti satu `snapshot` lengkap. Karena itu client harus selalu siap menerima `snapshot` di tengah jalan dan mengganti seluruh datanya.
+
+Pada radius 5 km di sekitar Bundaran HI (678 bus, `hz=4`), mode `snapshot` memakai sekitar 1,5 sampai 1,8 MB per detik, sedangkan mode `delta` sekitar 130 sampai 165 KB per detik. Server juga lebih ringan, karena yang di-encode di setiap tick hanya perubahannya.
+
+Contoh menerapkan pesan di client:
+
+```js
+const ws = new WebSocket("ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5&hz=4&mode=delta");
+const buses = new Map();
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === "error") return console.error(msg.detail);
+  if (msg.type === "snapshot") {
+    buses.clear();
+    for (const b of msg.buses) buses.set(b.bus_body_no, b);
+  } else if (msg.type === "delta") {
+    for (const u of msg.upsert) buses.set(u.bus_body_no, { ...buses.get(u.bus_body_no), ...u });
+    for (const no of msg.remove) buses.delete(no);
+  }
+};
+```
 
 ### Contoh client
 

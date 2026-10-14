@@ -42,7 +42,8 @@ Posisi bus hanya diambil dari `POST /v1/bus/offline`.
 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
-| `TJ_POLL_SECONDS` | `1` | Jarak antar polling upstream untuk area yang punya client WebSocket, sekaligus jarak antar `snapshot` yang dikirim ke setiap client WebSocket. `GET /buses` juga memakai data yang ada kalau umurnya belum melewati angka ini |
+| `TJ_POLL_SECONDS` | `0.5` | Jarak antar polling upstream untuk area yang punya client WebSocket. `GET /buses` juga memakai data yang ada kalau umurnya belum melewati angka ini |
+| `TJ_WS_BASE_SECONDS` | `1` | Jarak antar `snapshot` untuk client `WS /ws` dengan `hz=1`. Client dengan `hz=2` menerima dua `snapshot` dalam rentang ini, `hz=4` empat. Tidak memengaruhi polling upstream. Biasanya tidak perlu diubah; test memakainya untuk mempercepat jadwal |
 
 ## Cache dan masa simpan
 
@@ -60,7 +61,7 @@ Area dikenali dari lintang dan bujur yang dibulatkan ke 3 desimal (kisi sekitar 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
 | `TJ_DEFAULT_RADIUS_KM` | `1.0` | Radius kalau client tidak mengirim `radius_km` |
-| `TJ_MAX_RADIUS_KM` | `50.0` | Radius terbesar yang diizinkan. Nilai yang lebih besar dipotong ke angka ini |
+| `TJ_MAX_RADIUS_KM` | `30.0` | Radius terbesar yang diizinkan. Nilai yang lebih besar dipotong ke angka ini |
 
 Beban untuk upstream dan browser naik cepat seiring radius. Hasil pengukuran di sekitar Bundaran HI (13 Oktober 2026):
 
@@ -71,9 +72,9 @@ Beban untuk upstream dan browser naik cepat seiring radius. Hasil pengukuran di 
 | 10 km | 1.329 | 0,9 dtk |
 | 20 km | 2.347 | 1,1 dtk |
 
-Setiap area yang punya client WebSocket berarti satu request per detik (dengan `TJ_POLL_SECONDS=1`) ke `tijeapi`. Client di area yang sama berbagi polling itu, tapi setiap area berbeda menambah satu request per detik. Pada radius 20 km waktu respons upstream sudah sekitar 1 detik, jadi polling area itu praktis berjalan terus-menerus (polling berikutnya dilewati selama yang sebelumnya belum selesai).
+Setiap area yang punya client WebSocket berarti dua request per detik (dengan `TJ_POLL_SECONDS=0.5`) ke `tijeapi`. Client di area yang sama berbagi polling itu, tapi setiap area berbeda menambah dua request per detik. Nilai `hz` yang dipilih client tidak menambah polling. Pada radius 10 km ke atas waktu respons upstream sudah mendekati atau melebihi 0,5 detik, jadi polling area itu praktis berjalan terus-menerus (polling berikutnya dilewati selama yang sebelumnya belum selesai).
 
-Setiap `snapshot` WebSocket berisi semua bus dalam radius. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client. UI membatasi daftar ke 200 bus terdekat dan hanya memperbarui marker yang berubah, jadi peta tetap lancar, tapi bandwidth tetap besar. Kalau server dipakai banyak client sekaligus, pertimbangkan menurunkan `TJ_MAX_RADIUS_KM` atau menaikkan `TJ_POLL_SECONDS`.
+Setiap `snapshot` WebSocket berisi semua bus dalam radius. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per `snapshot`. Dengan `hz=4` bandwidth per client empat kali lipat. Isi `snapshot` dihitung dan di-encode sekali per area (dan per filter jalur), jadi banyaknya client tidak menambah kerja CPU, tetapi bandwidth tetap dihitung per client. UI membatasi daftar ke 200 bus terdekat dan hanya memperbarui marker yang berubah, jadi peta tetap lancar. Kalau server dipakai banyak client sekaligus, pertimbangkan menurunkan `TJ_MAX_RADIUS_KM`.
 
 Batas koordinat tidak bisa diubah lewat konfigurasi. Nilainya ada di `app/main.py`: lintang -7.5 sampai -5.5 dan bujur 106.0 sampai 107.5, kira-kira Jabodetabek dan sekitarnya.
 

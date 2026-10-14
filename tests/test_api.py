@@ -6,10 +6,11 @@ import time
 
 import httpx
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import create_app
+from app.main import DELTA_BACKLOG, _delta_view, _diff, _push, create_app
 from app.routes import decode_polyline
 from app.tracker import Tracker
 from app.upstream import TJClient
@@ -177,7 +178,11 @@ def fake():
 @pytest.fixture
 def client(fake):
     settings = Settings(
-        _env_file=None, device_id="test-device", bearer_token="", poll_seconds=0.05
+        _env_file=None,
+        device_id="test-device",
+        bearer_token="",
+        poll_seconds=0.05,
+        ws_base_seconds=0.05,
     )
     tj = TJClient(settings, transport=httpx.MockTransport(fake))
     tracker = Tracker(settings.bus_expiry_seconds)
@@ -329,22 +334,22 @@ def test_validation_and_upstream_errors(client, fake):
 def test_radius_capped_at_max(client, fake):
     assert (
         client.get(
-            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 50}
+            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 30}
         ).json()["radius_km"]
-        == 50
+        == 30
     )
     assert (
         client.get(
             "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 80}
         ).json()["radius_km"]
-        == 50
+        == 30
     )
     sent = {
         json.loads(c.content)["radius"]
         for c in fake.calls
         if c.url.path == "/v1/bus/offline"
     }
-    assert sent == {50.0}
+    assert sent == {30.0}
 
 
 def test_route_filter(client, fake):
@@ -393,6 +398,186 @@ def test_websocket_route_filter(client, fake):
         ]  # 4d matches case-insensitively, B never shows
 
 
+def count_frames(ws, seconds):
+    end, n = time.monotonic() + seconds, 0
+    while time.monotonic() < end:
+        assert ws.receive_json()["type"] == "snapshot"
+        n += 1
+    return n
+
+
+def test_websocket_hz(client, fake):
+    fake.offline_buses = [bus_msg(no="A")]
+    url = f"/ws?lat={MONAS[0]}&lon={MONAS[1]}"
+    # ws_base_seconds=0.05: hz=1 -> 20/s, default hz=2 -> 40/s, hz=4 -> 80/s.
+    with client.websocket_connect(url + "&hz=1") as ws:
+        slow = count_frames(ws, 0.5)
+    with client.websocket_connect(url) as ws:
+        default = count_frames(ws, 0.5)
+    with client.websocket_connect(url + "&hz=4") as ws:
+        fast = count_frames(ws, 0.5)
+    assert 6 <= slow <= 14, slow
+    assert 1.5 * slow <= default <= 2.5 * slow, (slow, default)
+    assert fast >= 3 * slow, (slow, fast)
+    # Upstream polling follows poll_seconds, not hz.
+    before = fake.paths().count("/v1/bus/offline")
+    with client.websocket_connect(url + "&hz=4") as ws:
+        count_frames(ws, 0.5)
+    polls = fake.paths().count("/v1/bus/offline") - before
+    assert 5 <= polls <= 12, polls
+
+
+def test_websocket_rejects_hz_not_dividing_ticks(client):
+    for hz in (0, 3, 5):
+        with (
+            pytest.raises(WebSocketDisconnect) as e,
+            client.websocket_connect(
+                f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&hz={hz}"
+            ) as ws,
+        ):
+            ws.receive_json()
+        assert e.value.code == 1008
+
+
+def test_websocket_work_is_shared_between_clients(client, fake):
+    fake.offline_buses = [bus_msg(no="A", route_code="4")]
+    calls = []
+    real = client.tracker.buses_near
+    client.tracker.buses_near = lambda *a, **kw: calls.append(a) or real(*a, **kw)
+    url = f"/ws?lat={MONAS[0]}&lon={MONAS[1]}"
+    with (
+        client.websocket_connect(url) as a,
+        client.websocket_connect(url) as b,
+        client.websocket_connect(url + "&routes=4") as c,
+    ):
+        for ws in (a, b, c):
+            ws.receive_json()
+        calls.clear()
+        for ws in (a, b, c):
+            for _ in range(5):
+                assert nos(ws.receive_json()) == ["A"]
+        # One buses_near per area per tick, however many clients; ~5 ticks passed, not 15.
+        assert len(calls) <= 8, len(calls)
+
+
+def test_diff_sends_only_changed_fields():
+    prev = {
+        "A": {"bus_body_no": "A", "latitude": 1.0, "route_code": "1"},
+        "B": {"bus_body_no": "B", "latitude": 2.0, "route_code": "1"},
+        "C": {"bus_body_no": "C", "latitude": 3.0, "route_code": "1"},
+    }
+    new = {
+        "A": {"bus_body_no": "A", "latitude": 1.5, "route_code": "1"},  # moved
+        "B": {"bus_body_no": "B", "latitude": 2.0, "route_code": "1"},  # still
+        "D": {"bus_body_no": "D", "latitude": 4.0, "route_code": "2"},  # new
+    }
+    assert _diff(prev, new) == {
+        "upsert": [{"bus_body_no": "A", "latitude": 1.5}, new["D"]],
+        "remove": ["C"],
+    }
+    assert _diff(new, new) == {"upsert": [], "remove": []}
+    view = _delta_view({"bus_body_no": "A", "latitude": -6.17600001, "age_seconds": 3})
+    assert view == {"bus_body_no": "A", "latitude": -6.176}
+
+
+def test_delta_client_too_far_behind_gets_a_snapshot():
+    c = {"queue": [], "ready": asyncio.Event()}
+    for i in range(DELTA_BACKLOG):
+        _push(c, f"d{i}", lambda: "snap")
+    assert len(c["queue"]) == DELTA_BACKLOG
+    _push(c, "one more", lambda: "snap")
+    assert c["queue"] == ["snap"] and c["ready"].is_set()
+
+
+def test_websocket_delta_mode(client, fake):
+    fake.offline_buses = [bus_msg(no="A"), bus_msg(no="S", lon=106.8275)]
+    with client.websocket_connect(
+        f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&mode=delta"
+    ) as ws:
+        first = ws.receive_json()
+        assert first["type"] == "snapshot" and nos(first) == ["A", "S"]
+        assert all(
+            "age_seconds" not in b and "received_at" in b for b in first["buses"]
+        )
+
+        # A moves a little, S stays, B appears.
+        fake.offline_buses = [
+            bus_msg(no="A", lat=-6.1761, ts=1001),
+            bus_msg(no="S", lon=106.8275),
+            bus_msg(no="B", ts=1001),
+        ]
+        seen_b = seen_a = False
+        for _ in range(100):
+            msg = ws.receive_json()
+            assert msg["type"] == "delta"
+            for u in msg["upsert"]:
+                assert u["bus_body_no"] != "S"  # unchanged buses are never sent
+                if u["bus_body_no"] == "B":
+                    seen_b = "route_code" in u  # new bus: whole object
+                if u["bus_body_no"] == "A":
+                    seen_a = True
+                    # moving bus: position and what follows from it, not the static fields
+                    assert "route_code" not in u and "route_color" not in u
+            if seen_a and seen_b:
+                break
+        assert seen_a and seen_b
+
+        # B leaves the radius.
+        fake.offline_buses = [bus_msg(no="B", lat=-6.30, lon=106.90, ts=1002)]
+        for _ in range(100):
+            msg = ws.receive_json()
+            if "B" in msg["remove"]:
+                break
+        else:
+            raise AssertionError("B never removed")
+
+
+def test_websocket_delta_shares_diff_between_clients(client, fake, monkeypatch):
+    from app import main
+
+    fake.offline_buses = [bus_msg(no="A")]
+    calls = []
+    real = main._diff
+    monkeypatch.setattr(main, "_diff", lambda *a: calls.append(1) or real(*a))
+    url = f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&mode=delta&hz=4"
+    with client.websocket_connect(url) as a, client.websocket_connect(url) as b:
+        a.receive_json(), b.receive_json()
+        time.sleep(0.2)  # ~16 ticks at ws_base_seconds=0.05, hz=4
+        assert 0 < len(calls) <= 20, len(calls)  # one diff per tick, not one per client
+        assert client.get("/health").json()["tracker"]["ws_clients"] == 2
+
+
+def test_websocket_rejects_unknown_mode(client):
+    with (
+        pytest.raises(WebSocketDisconnect) as e,
+        client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&mode=foo") as ws,
+    ):
+        ws.receive_json()
+    assert e.value.code == 1008
+
+
+def test_tracker_interpolates_between_polls():
+    t = Tracker(300, max_glide_seconds=5)
+    t.ingest([bus_msg(no="A", lat=-6.1760)], SOURCE)
+    time.sleep(0.2)
+    t.ingest([bus_msg(no="A", lat=-6.1770, ts=1001)], SOURCE)
+    bus = t.to_public("A")
+    assert bus["raw_latitude"] == -6.1770
+    assert abs(bus["latitude"] - -6.1760) < 0.0002  # glide just started
+    time.sleep(0.1)
+    mid = t.to_public("A")["latitude"]
+    assert -6.1768 < mid < -6.1762  # about halfway (0.1 s of a 0.2 s glide)
+    time.sleep(0.15)
+    assert t.to_public("A")["latitude"] == pytest.approx(-6.1770)
+
+    # A jump of several km is not driven across the map: it snaps.
+    t.ingest([bus_msg(no="A", lat=-6.30, ts=1002)], SOURCE)
+    assert t.to_public("A")["latitude"] == pytest.approx(-6.30)
+    # Same position again (overlapping areas) does not restart anything.
+    t.ingest([bus_msg(no="A", lat=-6.30, ts=1003)], SOURCE)
+    assert t.to_public("A")["latitude"] == pytest.approx(-6.30)
+
+
 def test_websocket_sends_snapshot_every_interval(client, fake):
     fake.offline_buses = [bus_msg(no="A"), bus_msg(no="FAR", lat=-6.30, lon=106.90)]
     with client.websocket_connect(
@@ -402,8 +587,8 @@ def test_websocket_sends_snapshot_every_interval(client, fake):
         snaps = [ws.receive_json() for _ in range(4)]
         assert all(m["type"] == "snapshot" and nos(m) == ["A"] for m in snaps)
         assert (
-            time.monotonic() - start >= 3 * 0.05 * 0.8
-        )  # paced by poll_seconds, not sent back to back
+            time.monotonic() - start >= 3 * 0.05 / 2 * 0.8
+        )  # paced by ws_base_seconds / default hz=2, not sent back to back
         assert snaps[0]["buses"][0]["distance_km"] < 1
 
         # Upstream moves A and adds B: later snapshots follow.
@@ -567,6 +752,7 @@ def test_health(client):
         "areas": 0,
         "ws_clients": 0,
         "poll_seconds": 0.05,
+        "ws_base_seconds": 0.05,
     }
     assert body["auth"]["mode"] == "guest"
 

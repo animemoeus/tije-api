@@ -56,7 +56,7 @@ Upstream menolak atau gagal menjawab. Pesan aslinya ada di `detail`:
 | Isi `detail` | Kemungkinan sebab |
 |---|---|
 | `HTTP 401 ...` | Token bermasalah. Restart server; kalau memakai `TJ_BEARER_TOKEN`, ganti tokennya |
-| `HTTP 429 ...` | Terlalu banyak request. Setiap area dengan client WebSocket berarti satu request per detik. Naikkan `TJ_POLL_SECONDS` atau kurangi jumlah area yang dibuka bersamaan |
+| `HTTP 429 ...` | Terlalu banyak request. Setiap area dengan client WebSocket berarti dua request per detik (`TJ_POLL_SECONDS=0.5`). Naikkan `TJ_POLL_SECONDS` atau kurangi jumlah area yang dibuka bersamaan |
 | `HTTP 5xx ...` | Server TransJakarta sedang bermasalah. Coba lagi nanti |
 | `ConnectTimeout`, `ConnectError` | Tidak ada internet atau `tijeapi` tidak terjangkau |
 | `response is not JSON` | Upstream mengembalikan halaman HTML, biasanya gangguan atau maintenance |
@@ -65,7 +65,7 @@ Hanya polling pertama sebuah area yang menghasilkan 502 (atau pesan `error` di W
 
 ## Peta patah-patah atau browser berat pada radius besar
 
-Setiap `snapshot` berisi semua bus dalam radius, satu kali per detik. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client. Turunkan radius, naikkan `TJ_POLL_SECONDS`, atau batasi `TJ_MAX_RADIUS_KM` di server. Klien yang hanya butuh beberapa jalur bisa memakai `WS /ws?routes=...` supaya `snapshot` lebih kecil.
+Setiap `snapshot` berisi semua bus dalam radius, `hz` kali per detik. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per `snapshot`, dan empat kali lipatnya dengan `hz=4`. Pakai `mode=delta` supaya hanya perubahan yang dikirim (sekitar 10 kali lebih kecil), turunkan radius, pakai `hz=1`, atau batasi `TJ_MAX_RADIUS_KM` di server. Klien yang hanya butuh beberapa jalur bisa memakai `WS /ws?routes=...` supaya `snapshot` lebih kecil.
 
 ## Port 8000 sudah dipakai
 

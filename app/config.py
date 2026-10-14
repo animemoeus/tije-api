@@ -30,15 +30,18 @@ class Settings(BaseSettings):
     login_email: str = ""
     login_password: str = ""
 
-    # Poll POST /v1/bus/offline for areas with a WebSocket client, and push a snapshot to them, this often.
-    poll_seconds: float = 1.0
+    # Poll POST /v1/bus/offline for areas with a WebSocket client this often.
+    poll_seconds: float = 0.5
+    # WebSocket clients with hz=1 get one snapshot per this many seconds (hz=4: four).
+    # Positions between polls are interpolated, so snapshots can come faster than polls.
+    ws_base_seconds: float = 1.0
     # Forget an area asked for only via GET /buses after this long without requests.
     area_idle_seconds: float = 60.0
     # Buses with no update for this long are dropped (the app uses 5 minutes).
     bus_expiry_seconds: float = 300.0
     default_radius_km: float = 1.0
     # Upstream honours large radii (20 km around Bundaran HI: ~2,300 buses, ~1 s per poll).
-    max_radius_km: float = 50.0
+    max_radius_km: float = 30.0
     # Route geometry (GET /v2/route/{code}) rarely changes; keep it this long.
     route_cache_seconds: float = 3600.0
 

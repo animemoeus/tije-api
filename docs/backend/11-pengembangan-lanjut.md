@@ -127,7 +127,7 @@ Backend tidak punya autentikasi untuk client. Sebelum dibuka ke publik:
 - Pasang reverse proxy (Caddy, Nginx) dengan HTTPS. Teruskan header `Upgrade` dan `Connection` supaya WebSocket jalan.
 - Tambahkan autentikasi sederhana di proxy (basic auth atau token) atau di FastAPI (dependency yang memeriksa header `X-API-Key`).
 - Jangan isi `TJ_LOGIN_EMAIL`/`TJ_LOGIN_PASSWORD` dengan akun pribadi kalau server publik, karena `/account/trips` akan menampilkan riwayat perjalanan akun itu ke siapa pun.
-- Batasi laju request dan jumlah koneksi WebSocket per IP di proxy. Setiap area baru yang dibuka client berarti satu request per detik ke `tijeapi`.
+- Batasi laju request dan jumlah koneksi WebSocket per IP di proxy. Setiap area baru yang dibuka client berarti dua request per detik ke `tijeapi`.
 - Sempitkan `allow_origins` di `CORSMiddleware` ke domain yang benar-benar memakai API.
 
 Contoh Caddy:
@@ -145,7 +145,7 @@ tj.contoh.id {
 
 | Batasan | Dampak | Kemungkinan solusi |
 |---|---|---|
-| Data hanya dari polling `POST /v1/bus/offline` | Posisi paling cepat diperbarui sekali per `TJ_POLL_SECONDS`, dan setiap area aktif berarti satu request per detik ke upstream | Naikkan `TJ_POLL_SECONDS` kalau beban upstream jadi masalah |
+| Data hanya dari polling `POST /v1/bus/offline` | Posisi dari upstream paling cepat diperbarui sekali per `TJ_POLL_SECONDS` (0,5 detik); di antaranya backend hanya menginterpolasi. Setiap area aktif berarti dua request per detik ke upstream | Naikkan `TJ_POLL_SECONDS` kalau beban upstream jadi masalah |
 | `snapshot` selalu berisi semua bus dalam radius | Radius 20 km ≈ 2.300 bus ≈ 1–2 MB per detik per client | Turunkan `TJ_MAX_RADIUS_KM`, pakai filter `routes`, atau kirim hanya bus yang berubah (diff) |
 | `estimated_time_next_stops` dari upstream sering 0 | ETA tidak bisa ditampilkan | Hitung sendiri dari `estimated_distance_next_stops` dan kecepatan rata-rata |
 | `speed` dari REST selalu 0 | Tidak bisa tahu bus berhenti atau jalan | Hitung dari perubahan posisi antar polling |

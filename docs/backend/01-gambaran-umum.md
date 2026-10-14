@@ -49,7 +49,7 @@ flowchart LR
 
 Satu-satunya sumber adalah endpoint upstream `POST /v1/bus/offline`, yang mengembalikan posisi semua bus di sekitar sebuah titik. Backend memanggilnya untuk setiap area yang sedang dipantau:
 
-- Area yang punya minimal satu client WebSocket di-polling terus setiap `TJ_POLL_SECONDS` (bawaan 1 detik). Client di area yang sama berbagi satu polling.
+- Area yang punya minimal satu client WebSocket di-polling terus setiap `TJ_POLL_SECONDS` (bawaan 0,5 detik). Client di area yang sama berbagi satu polling.
 - `GET /buses` memicu polling saat itu juga kalau data area tersebut lebih tua dari `TJ_POLL_SECONDS`.
 
 App asli juga bisa menerima posisi lewat MQTT, tapi broker-nya tidak bisa dihubungi dari jaringan pengembang, jadi jalur itu sudah dihapus dari backend ini. Field `source` di setiap bus menunjukkan asal datanya (`rest:/v1/bus/offline`).

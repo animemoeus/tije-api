@@ -96,15 +96,18 @@ Cache posisi terakhir setiap bus. Tidak punya koneksi, antrean, atau listener: i
 | Atribut | Isi |
 |---|---|
 | `bus_expiry_seconds` | Umur maksimal data bus sebelum dihapus `prune()` |
-| `_buses` | `bus_body_no` → `{"data": dict upstream, "source": str, "received_at": monotonic}` |
+| `max_glide_seconds` | Batas lama interpolasi satu perpindahan posisi (bawaan 5 detik) |
+| `_buses` | `bus_body_no` → `{"data": dict upstream, "source": str, "received_at": monotonic, "glide": ...}` |
+
+`glide` berisi `{"from", "to", "start", "dur"}`: posisi yang ditampilkan bergerak lurus dari `from` ke `to` selama `dur` detik sejak `start`. `ingest` membuat `glide` baru setiap kali upstream mengirim posisi yang berbeda. `from` adalah posisi yang sedang ditampilkan saat itu, jadi bus tidak meloncat. `dur` adalah jarak waktu sejak perubahan posisi sebelumnya, paling lama `max_glide_seconds`. Bus baru dan perpindahan lebih dari `SNAP_KM` (0,5 km) memakai `dur = 0`, artinya langsung ke posisi baru.
 
 | Method | Dipanggil dari | Keterangan |
 |---|---|---|
-| `Tracker(bus_expiry_seconds)` | lifespan, test | Buat cache kosong |
-| `ingest(items, source)` | `_poll_area`, test | Simpan setiap dict yang punya `bus_body_no`. Data dengan `timestamp` lebih lama dari yang tersimpan diabaikan |
+| `Tracker(bus_expiry_seconds, max_glide_seconds=5)` | lifespan, test | Buat cache kosong |
+| `ingest(items, source)` | `_poll_area`, test | Simpan setiap dict yang punya `bus_body_no` dan perbarui `glide`-nya. Data dengan `timestamp` lebih lama dari yang tersimpan diabaikan |
 | `prune()` | `_prune_loop` | Hapus bus yang tidak diperbarui selama `bus_expiry_seconds` |
-| `to_public(bus_body_no)` | API | Ubah data tersimpan menjadi [objek bus](04-referensi-api.md#objek-bus) |
-| `buses_near(lat, lon, radius_km, routes=None)` | `/buses`, `/ws` | Semua bus dalam radius (dan jalur, kalau diberi), urut jarak, dengan `distance_km` |
+| `to_public(bus_body_no)` | API | Ubah data tersimpan menjadi [objek bus](04-referensi-api.md#objek-bus). `latitude`/`longitude` diambil dari `glide_position(glide, sekarang)` |
+| `buses_near(lat, lon, radius_km, routes=None)` | `/buses`, `_broadcast_loop` | Semua bus dalam radius (dan jalur, kalau diberi), urut jarak, dengan `distance_km` |
 | `stats()` | `/health` | `{"buses": jumlah bus tersimpan}` |
 
 ## `app/routes.py`
@@ -124,12 +127,13 @@ Isi `lifespan`:
 
 1. `app.state.client`: `TJClient`.
 2. `app.state.tracker`: `Tracker(bus_expiry_seconds)`.
-3. `app.state.areas`: dict area yang sedang dipantau. Kunci `(round(lat, 3), round(lon, 3), radius)`, nilai `{"lat", "lon", "r", "last", "polled", "subscribers", "busy"}`:
+3. `app.state.areas`: dict area yang sedang dipantau. Kunci `(round(lat, 3), round(lon, 3), radius)`, nilai `{"lat", "lon", "r", "last", "polled", "clients", "busy"}`:
    - `last`: kapan terakhir diminta (`/buses`) atau dikirimi `snapshot` (`/ws`), dipakai untuk menghapus area menganggur;
    - `polled`: kapan polling terakhir berhasil, `0.0` kalau belum pernah;
-   - `subscribers`: jumlah client WebSocket di area ini;
+   - `clients`: daftar client WebSocket `mode=snapshot` di area ini. Setiap client berupa `{"routes", "every", "frame", "ready"}`: filter jalur, kirim setiap berapa tick (`4 // hz`), frame JSON terbaru, dan `asyncio.Event` yang menandai ada frame baru;
+   - `groups`: client `mode=delta`, dikelompokkan dengan kunci `(filter jalur, every)`. Setiap kelompok berupa `{"routes", "every", "state", "clients"}`. `state` adalah `bus_body_no` → bus terakhir yang dikirim (hasil `_delta_view`). Setiap client di kelompok berupa `{"queue", "ready"}`; `queue` adalah daftar frame yang belum terkirim;
    - `busy`: `True` selama polling area ini sedang berjalan.
-4. Tugas latar: `_prune_loop` dan `_poll_loop`.
+4. Tugas latar: `_prune_loop`, `_poll_loop`, dan `_broadcast_loop`.
 5. Saat berhenti: batalkan tugas, `client.aclose()`.
 
 ### Fungsi di dalam `create_app`
@@ -147,9 +151,15 @@ Isi `lifespan`:
 | `_poll_area(app, entry)` | `get_offline_buses` lalu `ingest` dengan sumber `rest:/v1/bus/offline`. Langsung kembali kalau area sedang `busy`. `UpstreamError` diteruskan ke pemanggil |
 | `_poll_quietly(app, entry)` | `_poll_area`, tapi error hanya ditulis ke log. Dipakai `_poll_loop` |
 | `_poll_loop(app, settings)` | Setiap `TJ_POLL_SECONDS`: polling paralel area yang punya client WebSocket (kecuali yang masih `busy`), hapus area tanpa client yang menganggur lebih dari `TJ_AREA_IDLE_SECONDS` |
+| `_broadcast_loop(app, settings)` | Setiap tick (`TJ_WS_BASE_SECONDS / WS_TICKS`): untuk setiap area dengan client yang jatuh tempo, `buses_near` sekali, encode JSON sekali per filter jalur, lalu taruh hasilnya di slot `frame` setiap client dan set `ready` |
+| `_snapshot(buses)` | `json.dumps({"type": "snapshot", "buses": buses})` |
+| `_ws_count(entry)` | Jumlah client WebSocket di area, `snapshot` dan `delta` |
+| `_delta_view(bus)` | Bus tanpa `age_seconds`, dengan `latitude`/`longitude` dibulatkan ke 6 desimal |
+| `_diff(prev, new)` | `{"upsert", "remove"}` dari dua dict `bus_body_no` → bus. Bus baru utuh, bus lama hanya field yang berubah |
+| `_push(client, frame, resync)` | Masukkan frame delta ke antrean client. Kalau antrean sudah `DELTA_BACKLOG`, ganti seluruhnya dengan `resync()` (satu `snapshot`) |
 | `_prune_loop(tracker)` | Setiap 30 detik: `tracker.prune()` |
 
-Handler `/ws` sendiri menjalankan dua tugas per koneksi: `read()` yang hanya menunggu client putus, dan `send()` yang mengirim `snapshot` dengan jadwal tetap setiap `TJ_POLL_SECONDS`. Begitu salah satunya selesai, keduanya dibatalkan dan `subscribers` area dikurangi.
+Handler `/ws` sendiri tidak menghitung apa pun setelah `snapshot` pertama. Handler memeriksa `hz`, mendaftarkan client ke `area["clients"]` (atau ke kelompoknya di `area["groups"]` untuk `mode=delta`; kelompok dibuat kalau belum ada dan dihapus saat client terakhirnya pergi), lalu menjalankan dua tugas: `read()` yang hanya menunggu client putus, dan `send()` yang menunggu `ready` lalu mengirim `frame`. Begitu salah satunya selesai, keduanya dibatalkan dan client dihapus dari `area["clients"]`.
 
 ### Konstanta
 
@@ -157,6 +167,8 @@ Handler `/ws` sendiri menjalankan dua tugas per koneksi: `read()` yang hanya men
 |---|---|---|
 | `LAT` | `ge=-7.5, le=-5.5` | Batas lintang parameter |
 | `LON` | `ge=106.0, le=107.5` | Batas bujur parameter |
+| `WS_TICKS` | `4` | Jumlah tick per `TJ_WS_BASE_SECONDS`. `hz` harus membagi angka ini, jadi yang valid 1, 2, dan 4 |
+| `DELTA_BACKLOG` | `8` | Batas antrean client `mode=delta`. Lewat dari ini, antrean diganti satu `snapshot` |
 
 ## Konkurensi
 

@@ -56,13 +56,18 @@ def bus_type(raw: Any) -> str:
     return "BRT" if t == "BRT" else "Mikrotrans" if t == "MIKROTRANS" else "Non-BRT"
 
 
+# A position change bigger than this is a jump (bus reappeared elsewhere), not movement: no glide.
+SNAP_KM = 0.5
+
+
 class Tracker:
-    def __init__(self, bus_expiry_seconds: float):
+    def __init__(self, bus_expiry_seconds: float, max_glide_seconds: float = 5.0):
         self.bus_expiry_seconds = bus_expiry_seconds
+        self.max_glide_seconds = max_glide_seconds
         self._lock = threading.Lock()
-        self._buses: dict[
-            str, dict[str, Any]
-        ] = {}  # bus_body_no -> {"data", "source", "received_at"}
+        # bus_body_no -> {"data", "source", "received_at", "received_wall", "glide"}
+        # glide: {"from", "to", "start", "dur"}, the shown position moves from "from" to "to" over dur seconds.
+        self._buses: dict[str, dict[str, Any]] = {}
 
     def prune(self) -> None:
         """Drop buses with no update for bus_expiry_seconds."""
@@ -89,7 +94,23 @@ class Tracker:
                     bus.get("timestamp")
                 ):
                     continue
-                self._buses[no] = {"data": bus, "source": source, "received_at": now}
+                glide = _next_glide(
+                    prev["glide"] if prev else None,
+                    bus_position(bus),
+                    now,
+                    self.max_glide_seconds,
+                )
+                self._buses[no] = {
+                    "data": bus,
+                    "source": source,
+                    "received_at": now,
+                    # Wall clock of the last *different* data, so an unchanged bus keeps the same
+                    # received_at (mode=delta only sends what changed).
+                    "received_wall": prev["received_wall"]
+                    if prev and prev["data"] == bus
+                    else time.time(),
+                    "glide": glide,
+                }
 
     # ---- Queries ---------------------------------------------------------
 
@@ -98,12 +119,14 @@ class Tracker:
             entry = self._buses.get(bus_body_no)
             if not entry:
                 return None
-            bus, source, received_at = (
+            bus, source, received_at, received_wall, glide = (
                 entry["data"],
                 entry["source"],
                 entry["received_at"],
+                entry["received_wall"],
+                entry["glide"],
             )
-        pos = bus_position(bus)
+        pos = glide_position(glide, time.monotonic()) if glide else None
         return {
             "bus_body_no": bus_body_no,
             "route_code": bus.get("route_code"),
@@ -127,6 +150,7 @@ class Tracker:
             "estimated_distance_next_stops": bus.get("estimated_distance_next_stops"),
             "source": source,
             "age_seconds": round(time.monotonic() - received_at, 1),
+            "received_at": round(received_wall, 1),
         }
 
     def buses_near(
@@ -147,6 +171,38 @@ class Tracker:
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {"buses": len(self._buses)}
+
+
+def glide_position(glide: dict[str, Any], now: float) -> tuple[float, float]:
+    """Where the bus is shown at `now`: linear between the previous and the newest upstream position."""
+    (lat0, lon0), (lat1, lon1) = glide["from"], glide["to"]
+    f = min(1.0, (now - glide["start"]) / glide["dur"]) if glide["dur"] > 0 else 1.0
+    return lat0 + (lat1 - lat0) * f, lon0 + (lon1 - lon0) * f
+
+
+def _next_glide(
+    prev: dict[str, Any] | None,
+    pos: tuple[float, float] | None,
+    now: float,
+    max_glide: float,
+) -> dict[str, Any] | None:
+    """Start a new glide when upstream reports a new position; keep the running one otherwise."""
+    if pos is None:
+        return None
+    if prev is None:
+        return {"from": pos, "to": pos, "start": now, "dur": 0.0}
+    if pos == prev["to"]:
+        return prev
+    shown = glide_position(prev, now)
+    if haversine_km(*shown, *pos) > SNAP_KM:
+        return {"from": pos, "to": pos, "start": now, "dur": 0.0}
+    # Glide over the time the last position took to arrive, so the bus keeps moving until the next one.
+    return {
+        "from": shown,
+        "to": pos,
+        "start": now,
+        "dur": min(now - prev["start"], max_glide),
+    }
 
 
 def _num(v: Any) -> float:

@@ -7,12 +7,12 @@ Backend kecil (FastAPI) yang menyediakan posisi bus TransJakarta secara live unt
 Alurnya meniru app Android TransJakarta v3.0.4 (hasil analisis bundle Hermes, sudah dicek ke server asli):
 
 1. Login: `POST /v1/auth/login {email, password}` kalau akun diisi di `.env`, kalau tidak `POST /v1/auth/login/guest`. Token (berlaku ±24 jam) dikirim sebagai `Authorization: Bearer …` dan diperbarui otomatis lewat `POST /v1/auth/token/refresh`.
-2. Posisi bus diambil dengan polling `POST /v1/bus/offline {latitude, longitude, radius, event:"change_loc"}`, default tiap 1 detik, hanya untuk area yang sedang dipantau client WebSocket. `GET /buses` mem-poll area-nya saat diminta.
-3. `WS /ws` mengirim snapshot semua bus di radius setiap 1 detik.
+2. Posisi bus diambil dengan polling `POST /v1/bus/offline {latitude, longitude, radius, event:"change_loc"}`, default tiap 0,5 detik, hanya untuk area yang sedang dipantau client WebSocket. `GET /buses` mem-poll area-nya saat diminta.
+3. `WS /ws` mengirim snapshot semua bus di radius 1, 2, atau 4 kali per detik (`hz`, default 2). Dengan `mode=delta`, setelah snapshot pertama hanya perubahan yang dikirim. Di antara dua polling, posisi bus digeser bertahap di backend supaya gerakannya halus.
 
 Backend ini tidak memakai MQTT. App aslinya memakai broker MQTT (`wss://mqtt.tj.co.id:8084/mqtt`), tetapi broker itu tidak bisa dihubungi dari luar jaringan mereka.
 
-> `tijeapi.transjakarta.co.id` bukan API publik resmi. Formatnya bisa berubah sewaktu-waktu, dan pemakaian di luar app mungkin melanggar ketentuan layanan TransJakarta. Tiap area yang punya client WebSocket aktif = 1 request per detik ke server mereka; client di area yang sama berbagi satu poll. Naikkan `TJ_POLL_SECONDS` kalau perlu mengurangi beban.
+> `tijeapi.transjakarta.co.id` bukan API publik resmi. Formatnya bisa berubah sewaktu-waktu, dan pemakaian di luar app mungkin melanggar ketentuan layanan TransJakarta. Tiap area yang punya client WebSocket aktif = 2 request per detik ke server mereka; client di area yang sama berbagi satu poll. Naikkan `TJ_POLL_SECONDS` kalau perlu mengurangi beban.
 
 ## Login akun TransJakarta (opsional)
 
@@ -67,7 +67,7 @@ Halaman ini memanggil API di origin yang sama. Untuk memakai file HTML-nya dari 
 | GET | `/buses/{bus_body_no}` | Status terakhir satu bus (areanya harus sudah pernah diminta lewat `/buses` atau `/ws`) |
 | GET | `/buses/offline?lat=&lon=&radius_km=` | Diteruskan apa adanya dari `POST /v1/bus/offline` |
 | GET | `/stops?lat=&lon=&radius_km=` | Halte/bus stop di sekitar, diteruskan dari `GET /v2/bus-stop` |
-| WS | `/ws?lat=&lon=&radius_km=` | Pesan `{"type":"snapshot","buses":[…]}` tiap 1 detik (`TJ_POLL_SECONDS`), berisi semua bus di dalam radius |
+| WS | `/ws?lat=&lon=&radius_km=&hz=&mode=` | Pesan `{"type":"snapshot","buses":[…]}` `hz` kali per detik (1, 2, atau 4; default 2), berisi semua bus di dalam radius. `mode=delta`: satu snapshot, lalu `{"type":"delta","upsert":[…],"remove":[…]}` berisi perubahan saja |
 
 `radius_km` default 1, maksimal 20. `routes=4,4D` menyaring jalur (di `/buses` dan `/ws`). Koordinat dibatasi ke sekitar Jakarta.
 
@@ -130,6 +130,6 @@ Setelah itu `ruff check --fix` dan `ruff format` jalan otomatis tiap commit. Unt
 ## Catatan
 
 - Sudah dicek ke server asli: login guest, `POST /v1/bus/offline`, `GET /v2/bus-stop`, dan `WS /ws` (snapshot tiap ±1,00 detik).
-- Snapshot radius besar cukup berat: radius 20 km ≈ 2.300 bus ≈ 1–2 MB per detik per client.
+- Snapshot radius besar cukup berat: radius 20 km ≈ 2.300 bus ≈ 1–2 MB per snapshot per client, empat kali lipat dengan `hz=4`.
 - `estimated_time_next_stops` sering bernilai `0` dari upstream; UI menampilkan jarak ke halte berikutnya (`estimated_distance_next_stops`, meter).
 - Login dengan akun (`/v1/auth/login`) dibuat dari analisis bundle dan sudah dites dengan upstream palsu; belum dicoba dengan akun asli.
