@@ -38,6 +38,13 @@
     .rchip small { font-weight: 400; opacity: .85; margin-left: 3px; }
     .chips.filtering .rchip { opacity: .35; }
     .chips.filtering .rchip.on { opacity: 1; box-shadow: 0 0 0 2px var(--text); }
+    button.mini { padding: 1px 6px; font-size: 12px; }
+    .routebar { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--border);
+      border-radius: 6px; background: var(--bg); font-size: 13px; }
+    .routebar[hidden] { display: none; }
+    .routebar > div { flex: 1; min-width: 0; }
+    .routebar small { color: var(--muted); }
+    .routebar.err { border-color: var(--err); color: var(--err); }
     .list { overflow-y: auto; flex: 1; min-height: 0; }
     .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
     .bus { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; display: grid; gap: 4px; }
@@ -88,9 +95,11 @@
         <label for="routeInput">Jalur</label>
         <input id="routeInput" placeholder="mis. 4, 4D, 1" autocomplete="off" />
         <button id="routeClear">Semua</button>
+        <button id="routeShow" title="Gambar jalur yang sedang disaring">Gambar jalur</button>
       </div>
       <div id="routeChips" class="chips"></div>
-      <p class="hint">Klik peta untuk memilih titik pantau. Klik kode jalur untuk menyaring.</p>
+      <div id="routeBar" class="routebar" hidden><div id="routeInfo"></div><button id="routeHide" class="mini">Tutup</button></div>
+      <p class="hint">Klik peta untuk memilih titik pantau. Klik kode jalur untuk menyaring. Tombol <b>Jalur</b> di bus menggambar rute yang akan dilewatinya.</p>
     </div>
     <div id="list" class="list"><div class="empty">Belum ada bus di area ini.</div></div>
   </aside>
@@ -165,7 +174,8 @@
   function popupHtml(b) {
     return `<b>${esc(b.route_code)}</b> ${b.trip_headsign ? "→ " + esc(b.trip_headsign) : ""} · ${esc(b.type)}<br>` +
            `<small>${esc(b.bus_body_no)}</small><br>` +
-           `Berikutnya: <b>${esc(b.next_stop_name || "-")}</b><br>${esc(nextInfo(b))}`;
+           `Berikutnya: <b>${esc(b.next_stop_name || "-")}</b><br>${esc(nextInfo(b))}` +
+           `<div style="margin-top:6px"><button class="mini showRoute" data-no="${esc(b.bus_body_no)}">Lihat jalur</button></div>`;
   }
 
   // Markers of filtered-out routes stay in memory but off the map, so toggling the filter is instant.
@@ -184,6 +194,7 @@
       // Snapshots repeat every bus each second; only touch markers that changed.
       if (old.latitude === b.latitude && old.longitude === b.longitude && old.bearing === b.bearing && old.timestamp === b.timestamp) return;
       entry.marker.setLatLng([b.latitude, b.longitude]).setIcon(busIcon(b)).setPopupContent(popupHtml(b));
+      if (state.route && state.route.busNo === b.bus_body_no && state.route.data) redrawRoute();
     } else {
       const marker = L.marker([b.latitude, b.longitude], { icon: busIcon(b) }).bindPopup(popupHtml(b));
       entry = { data: b, marker, seen: Date.now() };
@@ -283,7 +294,8 @@
       return `<div class="bus" data-no="${esc(b.bus_body_no)}">
         <div class="top"><span class="chip" style="background:${bg};color:${fg}">${esc(b.route_code || "?")}</span>
           <span class="chip type">${esc(b.type)}</span>${b.trip_headsign ? `<span>→ ${esc(b.trip_headsign)}</span>` : ""}
-          <span class="no">${esc(b.bus_body_no)}</span></div>
+          <span class="no">${esc(b.bus_body_no)}</span>
+          <button class="mini showRoute" data-no="${esc(b.bus_body_no)}" title="Gambar jalur yang akan dilewati">Jalur</button></div>
         <div class="next">Berikutnya: <b>${esc(b.next_stop_name || "-")}</b></div>
         <div class="meta">${esc([nextInfo(b), dist ? dist + " dari titik" : ""].filter(Boolean).join(" · "))}</div>
       </div>`;
@@ -295,6 +307,231 @@
     const entry = el && state.buses.get(el.dataset.no);
     if (entry) { map.panTo(entry.marker.getLatLng()); entry.marker.openPopup(); }
   });
+
+  // ---- Route lines (GET /routes/{code}) ----------------------------------
+  // state.route = {codes, busNo, bus, data} for what is drawn; null when nothing is.
+  const routeLayer = L.layerGroup().addTo(map);
+  const routeCache = new Map(); // code -> Promise<route>
+  const MAX_ROUTES_DRAWN = 6;
+
+  function fetchRoute(code) {
+    if (!routeCache.has(code)) {
+      const p = fetch(new URL("/routes/" + encodeURIComponent(code), API)).then(async (res) => {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+        return body;
+      });
+      p.catch(() => routeCache.delete(code)); // Let a failed fetch be retried.
+      routeCache.set(code, p);
+    }
+    return routeCache.get(code);
+  }
+
+  // Flat projection in metres around lat0; accurate enough at city scale.
+  const xy = (p, lat0) => [p[1] * 111320 * Math.cos(lat0 * Math.PI / 180), p[0] * 110540];
+
+  // Nearest point to p on segments path[from..to]: {i: segment start, pt: [lat, lon], d: metres}.
+  function nearestOnPath(path, p, from = 0, to = path.length - 1) {
+    const P = xy(p, p[0]);
+    let best = { i: Math.max(0, from), pt: path[Math.max(0, from)] || p, d: Infinity };
+    for (let i = Math.max(0, from); i < Math.min(to, path.length - 1); i++) {
+      const A = xy(path[i], p[0]), B = xy(path[i + 1], p[0]);
+      const dx = B[0] - A[0], dy = B[1] - A[1], len = dx * dx + dy * dy;
+      const t = len ? Math.max(0, Math.min(1, ((P[0] - A[0]) * dx + (P[1] - A[1]) * dy) / len)) : 0;
+      const d = Math.hypot(P[0] - A[0] - t * dx, P[1] - A[1] - t * dy);
+      if (d < best.d) best = { i, d, pt: [path[i][0] + t * (path[i + 1][0] - path[i][0]), path[i][1] + t * (path[i + 1][1] - path[i][1])] };
+    }
+    return best;
+  }
+
+  // Path segment of each stop, in travel order. Loop routes run along the same street twice, so each stop is
+  // searched only after the previous one, and the first segment within 40 m wins over a closer one further on.
+  function stopSegments(dir) {
+    if (dir._seg) return dir._seg;
+    let from = 0;
+    dir._seg = dir.stops.map((s) => {
+      const p = [s.lat, s.lon];
+      let best = nearestOnPath(dir.path, p, from);
+      for (let i = from; i < dir.path.length - 1; i++) {
+        const n = nearestOnPath(dir.path, p, i, i + 1);
+        if (n.d < 40) { best = n; break; }
+      }
+      return (from = best.i);
+    });
+    return dir._seg;
+  }
+
+  const lc = (s) => String(s ?? "").trim().toLowerCase();
+  // "Blok M Jalur 1" names the stop "Blok M": match either way round.
+  const sameStop = (a, b) => !!a && !!b && (lc(a).startsWith(lc(b)) || lc(b).startsWith(lc(a)));
+  const nextStopId = (bus) => String(bus.next_stops || "").split("-")[0];
+  const stopIndex = (dir, pred, from = 0) => { const i = dir.stops.slice(from).findIndex(pred); return i < 0 ? -1 : i + from; };
+
+  function segBearing(path, i) {
+    const a = path[i], b = path[Math.min(i + 1, path.length - 1)], A = xy(a, a[0]), B = xy(b, a[0]);
+    return (Math.atan2(B[0] - A[0], B[1] - A[1]) * 180 / Math.PI + 360) % 360;
+  }
+
+  // Direction the bus is driving. Buses often run short trips (trip_id 1-P28 → "Monumen Nasional") that match
+  // neither route trip_id, and both directions share stop codes, so score each direction on: previous stop before
+  // the next one, destination still ahead, heading along the path, and distance to the path.
+  function pickDirection(route, bus) {
+    const dirs = route.directions, pos = [bus.latitude, bus.longitude];
+    if (dirs.length < 2) return dirs[0];
+    const exact = dirs.find((d) => d.trip_id && lc(d.trip_id) === lc(bus.trip_id));
+    if (exact) return exact;
+    const id = nextStopId(bus), heading = Number(bus.bearing);
+    const score = (d) => {
+      let s = 0;
+      const k = stopIndex(d, (x) => x.stop_id === id);
+      const p = stopIndex(d, (x) => lc(x.name) === lc(bus.prev_stop_name));
+      const h = stopIndex(d, (x) => sameStop(x.name, bus.trip_headsign), Math.max(k, 0));
+      if (k >= 0 && p >= 0) s += p < k ? 2 : -2;
+      if (bus.trip_headsign) s += h >= 0 ? 1 : -1;
+      if (sameStop(d.headsign, bus.trip_headsign)) s += 2;
+      const near = nearestOnPath(d.path, pos);
+      if (heading && near.d < 100) {
+        const diff = Math.abs(((segBearing(d.path, near.i) - heading) % 360 + 540) % 360 - 180);
+        s += diff < 60 ? 1.5 : diff > 120 ? -1.5 : 0;
+      }
+      return s - near.d / 1000;
+    };
+    return dirs.map((d) => [score(d), d]).sort((a, b) => b[0] - a[0])[0][1];
+  }
+
+  // Where the bus is along a direction: {near: nearest point on the path, next: index of the next stop,
+  // end: index of the last stop of this trip (its headsign, else the end of the route), endPt: that stop on the path}.
+  function progress(dir, bus) {
+    const pos = [bus.latitude, bus.longitude], seg = stopSegments(dir);
+    const id = nextStopId(bus);
+    let next = id ? dir.stops.findIndex((s) => s.stop_id === id) : -1;
+    let near;
+    if (next >= 0) {
+      // Known next stop: the bus is between the previous stop and that one.
+      near = nearestOnPath(dir.path, pos, next > 0 ? seg[next - 1] : 0, seg[next] + 1);
+    } else {
+      near = nearestOnPath(dir.path, pos);
+      next = seg.findIndex((i) => i > near.i);
+      if (next < 0) next = dir.stops.length;
+    }
+    let end = stopIndex(dir, (s) => sameStop(s.name, bus.trip_headsign), Math.min(next, dir.stops.length));
+    if (end < 0) end = dir.stops.length - 1;
+    const s = dir.stops[end];
+    const endAt = s ? nearestOnPath(dir.path, [s.lat, s.lon], seg[end], seg[end] + 1) : null;
+    return { near, next, end, endAt };
+  }
+
+  // Path from the bus to the end of its trip.
+  function aheadPath(dir, prog) {
+    const { near, endAt } = prog;
+    if (!endAt || endAt.i < near.i) return [near.pt, ...dir.path.slice(near.i + 1)];
+    return [near.pt, ...dir.path.slice(near.i + 1, endAt.i + 1), endAt.pt];
+  }
+
+  function drawRoutes(routes, bus) {
+    routeLayer.clearLayers();
+    const bounds = L.latLngBounds([]);
+    let info = null;
+    for (const r of routes) {
+      const c = color(r.route_color, "#174ca1");
+      const dirs = bus ? [pickDirection(r, bus)] : r.directions;
+      const seen = new Set();
+      for (const d of dirs) {
+        const prog = bus ? progress(d, bus) : null;
+        if (prog) info = { route: r, dir: d, prog };
+        // Whole direction; with a bus, faded, plus the part still ahead of the bus drawn thick on top.
+        L.polyline(d.path, { color: c, weight: prog ? 4 : 5, opacity: prog ? 0.35 : 0.8, interactive: false }).addTo(routeLayer);
+        if (prog) L.polyline(aheadPath(d, prog), { color: c, weight: 7, opacity: 0.95, interactive: false }).addTo(routeLayer);
+        d.path.forEach((p) => bounds.extend(p));
+        d.stops.forEach((s, k) => {
+          if (seen.has(s.stop_id)) return;
+          seen.add(s.stop_id);
+          // Faded: already passed, or beyond where this trip ends.
+          const passed = prog && (k < prog.next || k > prog.end);
+          const left = prog && !passed ? ` · ${k - prog.next + 1} halte lagi` : "";
+          L.circleMarker([s.lat, s.lon], { radius: 5, color: c, weight: 2, fillColor: "#fff", fillOpacity: passed ? 0.4 : 1,
+            opacity: passed ? 0.4 : 1, bubblingMouseEvents: false })
+            .bindPopup(`<b>${esc(s.name)}</b><br>${esc(r.route_code)} → ${esc(d.headsign || "-")} · halte ${k + 1}/${d.stops.length}${left}`)
+            .addTo(routeLayer);
+        });
+      }
+    }
+    return { bounds, info };
+  }
+
+  function chipHtml(r) {
+    return `<span class="chip" style="background:${color(r.route_color, "#174ca1")};color:${color(r.route_text_color, "#ffffff")}">${esc(r.route_code)}</span>`;
+  }
+
+  function setRouteBar(html, isError) {
+    $("routeBar").hidden = false;
+    $("routeBar").classList.toggle("err", !!isError);
+    $("routeInfo").innerHTML = html;
+  }
+
+  function redrawRoute() {
+    const r = state.route, entry = r.busNo && state.buses.get(r.busNo);
+    if (entry) r.bus = entry.data; // Keep the last known position when the bus leaves the area.
+    const { bounds, info } = drawRoutes(r.data, r.bus);
+    if (info) {
+      const { route, dir, prog } = info, left = prog.end - prog.next + 1;
+      const next = dir.stops[prog.next], dest = dir.stops[prog.end];
+      setRouteBar(`${chipHtml(route)} ${esc(route.route_name || "")}<br><small>Bus ${esc(r.bus.bus_body_no)} menuju ` +
+        `<b>${esc((dest && dest.name) || dir.headsign || "-")}</b> · ` +
+        `${left > 0 && next ? `${left} halte lagi, berikutnya ${esc(next.name)}` : "di akhir rute"}</small>`);
+    } else {
+      setRouteBar(r.data.map((x) => `${chipHtml(x)} ${esc(x.route_name || "")}`).join("<br>") +
+        `<br><small>${r.data.reduce((n, x) => n + x.directions.length, 0)} arah</small>`);
+    }
+    return bounds;
+  }
+
+  async function showRoute(codes, busNo = null) {
+    const token = (state.routeToken = (state.routeToken || 0) + 1);
+    const entry = busNo && state.buses.get(busNo);
+    state.route = { codes, busNo, bus: entry ? entry.data : null, data: null };
+    setRouteBar(`Memuat jalur ${esc(codes.join(", "))}…`);
+    try {
+      const data = await Promise.all(codes.map(fetchRoute));
+      if (token !== state.routeToken) return; // Another route was picked meanwhile.
+      state.route.data = data;
+      const bounds = redrawRoute();
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
+    } catch (err) {
+      if (token !== state.routeToken) return;
+      routeLayer.clearLayers();
+      setRouteBar(`Gagal memuat jalur: ${esc(err.message)}`, true);
+    }
+  }
+
+  function hideRoute() {
+    state.routeToken = (state.routeToken || 0) + 1;
+    state.route = null;
+    routeLayer.clearLayers();
+    $("routeBar").hidden = true;
+  }
+
+  function showBusRoute(no) {
+    const entry = state.buses.get(no);
+    if (!entry || !entry.data.route_code) return;
+    map.closePopup();
+    showRoute([String(entry.data.route_code).trim()], no);
+  }
+
+  // Capture phase: Leaflet popups stop click propagation, and the list's own handler should not also pan.
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest && e.target.closest(".showRoute");
+    if (!btn) return;
+    e.stopPropagation();
+    showBusRoute(btn.dataset.no);
+  }, true);
+
+  $("routeShow").addEventListener("click", () => {
+    const codes = [...state.routes].sort(byRoute);
+    if (!codes.length) return setRouteBar("Pilih jalur dulu: ketik kodenya di kolom Jalur atau klik chip.", true);
+    showRoute(codes.slice(0, MAX_ROUTES_DRAWN));
+  });
+  $("routeHide").addEventListener("click", hideRoute);
 
   function connect() {
     clearTimeout(state.timer);

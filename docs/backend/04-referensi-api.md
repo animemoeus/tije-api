@@ -47,7 +47,7 @@ Error validasi parameter (HTTP 422) memakai format bawaan FastAPI, berisi daftar
 | 200 | Berhasil |
 | 307 | Redirect (hanya `GET /`) |
 | 403 | Endpoint butuh akun TransJakarta, tapi backend sedang login sebagai guest |
-| 404 | Data tidak ditemukan, misalnya bus yang belum pernah terlihat |
+| 404 | Data tidak ditemukan, misalnya bus yang belum pernah terlihat atau kode rute yang tidak dikenal |
 | 422 | Parameter salah atau di luar batas |
 | 502 | Server TransJakarta menolak atau gagal menjawab. Pesan aslinya ada di `detail` |
 
@@ -61,6 +61,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
   "route_code": "1",
   "route_name": "Kota",
   "trip_headsign": "Kota",
+  "trip_id": "1-R07",
   "route_color": "D62126",
   "route_text_color": "FFFFFF",
   "type": "BRT",
@@ -88,6 +89,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
 | `route_code` | string | upstream | Kode rute/koridor, misalnya `1`, `4C`, `JAK.10` |
 | `route_name` | string \| null | upstream | Nama rute |
 | `trip_headsign` | string \| null | upstream | Tujuan akhir perjalanan saat ini |
+| `trip_id` | string \| null | upstream | ID perjalanan, misalnya `1-R07`. Perjalanan reguler sama dengan `trip_id` salah satu arah di `GET /routes/{route_code}`; perjalanan pendek memakai ID lain (`1-P28`) |
 | `route_color` | string | upstream | Warna rute dalam hex tanpa `#` |
 | `route_text_color` | string | upstream | Warna teks di atas warna rute |
 | `type` | string | turunan | `BRT`, `Mikrotrans`, atau `Non-BRT`. Nilai upstream selain BRT dan Mikrotrans (misalnya `Angkutan Umum Integrasi`, `Royaltrans`) menjadi `Non-BRT`, sama seperti di app |
@@ -320,6 +322,7 @@ curl http://localhost:8000/buses/MYS-17022
   "route_code": "1",
   "route_name": "Kota",
   "trip_headsign": "Kota",
+  "trip_id": "1-R07",
   "route_color": "D62126",
   "route_text_color": "FFFFFF",
   "type": "BRT",
@@ -466,6 +469,61 @@ curl "http://localhost:8000/stops?lat=-6.1950&lon=106.8231&radius_km=0.5"
 | `stop_gates` | Data pintu halte (sering kosong) |
 
 Upstream membatasi hasil 20 halte per permintaan (`meta.limit = 20`).
+
+---
+
+## `GET /routes/{route_code}`
+
+Jalur rute beserta haltenya per arah, untuk menggambar rute di peta. Diambil dari `GET /v2/route/{route_code}` upstream, lalu diringkas: polyline upstream (Google encoded polyline, 5 desimal) sudah di-decode menjadi daftar koordinat. Hasil disimpan di memori selama `TJ_ROUTE_CACHE_SECONDS` (bawaan 1 jam).
+
+**Parameter path**: `route_code`, kode rute seperti di objek bus (`1`, `4D`, `JAK.10`). Tidak peka huruf besar-kecil.
+
+**Request**
+
+```powershell
+curl http://localhost:8000/routes/1
+```
+
+**Response 200**
+
+```json
+{
+  "route_code": "1",
+  "route_name": "Blok M - Kota",
+  "route_type": "BRT",
+  "route_color": "D62126",
+  "route_text_color": "FFFFFF",
+  "directions": [
+    {
+      "direction": "outbound",
+      "trip_id": "1-R07",
+      "headsign": "Kali Besar Barat",
+      "path": [[-6.24324, 106.80175], [-6.24325, 106.80216], "... (237 item total)"],
+      "stops": [
+        { "stop_id": "H00014P", "name": "Blok M", "lat": -6.243312, "lon": 106.80175, "type": "halte" },
+        "... (20 item total)"
+      ]
+    },
+    {
+      "direction": "inbound",
+      "trip_id": "1-R08",
+      "headsign": "Blok M",
+      "path": ["... (228 item total)"],
+      "stops": ["... (22 item total)"]
+    }
+  ]
+}
+```
+
+| Field | Keterangan |
+|---|---|
+| `directions[].direction` | `outbound`, `inbound`, atau `loop`. Rute melingkar (misalnya `4D`) hanya punya `loop` |
+| `directions[].trip_id` | ID perjalanan reguler arah ini. Bus dengan `trip_id` sama berjalan di arah ini |
+| `directions[].headsign` | Tujuan arah ini |
+| `directions[].path` | Garis jalan `[lat, lon]` sesuai urutan perjalanan. Kalau upstream tidak mengirim polyline, berisi garis lurus antarhalte |
+| `directions[].stops` | Halte sesuai urutan perjalanan. `stop_id` sama dengan kode di `next_stops` bus. Kode yang sama bisa muncul di kedua arah |
+
+**Error**: 404 kalau rute tidak dikenal upstream (`Rute tidak ditemukan`) atau tidak punya jalur, 502 kalau upstream gagal.
 
 ---
 

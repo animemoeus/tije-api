@@ -18,6 +18,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, settings as default_settings
+from .routes import normalize_route
 from .tracker import Tracker, parse_routes, route_matches
 from .upstream import TJClient, UpstreamError
 
@@ -39,6 +40,7 @@ def create_app(
         app.state.tracker = tracker or Tracker(settings.bus_expiry_seconds)
         # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled", "subscribers", "busy"}
         app.state.areas = {}
+        app.state.routes = {}  # route code -> (fetched_at, normalized route)
         tasks = [asyncio.create_task(_prune_loop(app.state.tracker)), asyncio.create_task(_poll_loop(app, settings))]
         yield
         for t in tasks:
@@ -139,6 +141,28 @@ def create_app(
             return await request.app.state.client.get_bus_stops(lat, lon, radius_param(radius_km))
         except UpstreamError as e:
             raise HTTPException(502, f"upstream error: {e}") from e
+
+    @app.get("/routes/{route_code}")
+    async def route_detail(request: Request, route_code: str) -> dict[str, Any]:
+        """Route path and stops per direction (upstream GET /v2/route/{code}), for drawing a route on the map.
+
+        Match a bus to a direction by its `trip_id`. Cached for `route_cache_seconds`."""
+        code = route_code.strip().upper()
+        cache: dict[str, tuple[float, dict[str, Any]]] = request.app.state.routes
+        hit = cache.get(code)
+        if hit and time.monotonic() - hit[0] < settings.route_cache_seconds:
+            return hit[1]
+        try:
+            data = await request.app.state.client.get_route(code)
+        except UpstreamError as e:
+            if e.status == 404:
+                raise HTTPException(404, f"route {code} not found") from e
+            raise HTTPException(502, f"upstream error: {e}") from e
+        route = normalize_route(code, data)
+        if not route["directions"]:
+            raise HTTPException(404, f"route {code} has no path")
+        cache[code] = (time.monotonic(), route)
+        return route
 
     @app.get("/account")
     async def account(request: Request) -> dict[str, Any]:

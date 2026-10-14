@@ -11,13 +11,14 @@ python/
 │   ├── config.py         Settings (pydantic-settings)
 │   ├── upstream.py       TJClient: semua request ke tijeapi
 │   ├── tracker.py        Tracker: cache posisi bus, penyaringan radius
+│   ├── routes.py         decode polyline, ringkas data rute
 │   ├── main.py           FastAPI: endpoint, area, polling, lifespan
 │   └── static/
 │       └── index.html    UI peta
 ├── docs/                 dokumentasi ini
 └── tests/
     ├── __init__.py
-    └── test_api.py       20 test, upstream palsu
+    └── test_api.py       23 test, upstream palsu
 ```
 
 Ketergantungan antar modul hanya satu arah:
@@ -27,6 +28,7 @@ flowchart LR
     main[main.py] --> config[config.py]
     main --> upstream[upstream.py]
     main --> tracker[tracker.py]
+    main --> routes[routes.py]
     upstream --> config
 ```
 
@@ -104,6 +106,13 @@ Cache posisi terakhir setiap bus. Tidak punya koneksi, antrean, atau listener: i
 | `to_public(bus_body_no)` | API | Ubah data tersimpan menjadi [objek bus](04-referensi-api.md#objek-bus) |
 | `buses_near(lat, lon, radius_km, routes=None)` | `/buses`, `/ws` | Semua bus dalam radius (dan jalur, kalau diberi), urut jarak, dengan `distance_km` |
 | `stats()` | `/health` | `{"buses": jumlah bus tersimpan}` |
+
+## `app/routes.py`
+
+| Fungsi | Keterangan |
+|---|---|
+| `decode_polyline(encoded, precision=5)` | Google encoded polyline → `[[lat, lon], ...]`. Input yang terpotong menghasilkan titik yang sempat terbaca |
+| `normalize_route(route_code, data)` | `data` dari `GET /v2/route/{code}` → bentuk respons `GET /routes/{route_code}`. Arah yang `null` dilewati; arah tanpa polyline memakai garis lurus antarhalte |
 
 ## `app/main.py`
 

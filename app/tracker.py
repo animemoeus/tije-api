@@ -97,6 +97,7 @@ class Tracker:
             "route_code": bus.get("route_code"),
             "route_name": bus.get("route_name"),
             "trip_headsign": bus.get("trip_headsign"),
+            "trip_id": bus.get("trip_id"),
             "route_color": bus.get("route_color"),
             "route_text_color": bus.get("route_text_color"),
             "type": bus_type(bus.get("type")),

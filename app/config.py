@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     default_radius_km: float = 1.0
     # Upstream honours large radii (20 km around Bundaran HI: ~2,300 buses, ~1 s per poll).
     max_radius_km: float = 20.0
+    # Route geometry (GET /v2/route/{code}) rarely changes; keep it this long.
+    route_cache_seconds: float = 3600.0
 
 
 settings = Settings()

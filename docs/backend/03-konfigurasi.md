@@ -50,6 +50,7 @@ Posisi bus hanya diambil dari `POST /v1/bus/offline`.
 |---|---|---|
 | `TJ_AREA_IDLE_SECONDS` | `60` | Area yang hanya diminta lewat `GET /buses` (tanpa client WebSocket) dilupakan setelah tidak diminta selama ini. Area dengan client WebSocket tidak pernah dilupakan selama client masih tersambung |
 | `TJ_BUS_EXPIRY_SECONDS` | `300` | Bus yang tidak mendapat update selama ini dihapus dari memori. App asli juga memakai 5 menit |
+| `TJ_ROUTE_CACHE_SECONDS` | `3600` | Jalur rute dari `GET /routes/{route_code}` disimpan di memori selama ini sebelum diambil ulang dari upstream |
 
 Area dikenali dari lintang dan bujur yang dibulatkan ke 3 desimal (kisi sekitar 100 meter) ditambah radius. Dua client yang memilih titik hampir sama dengan radius sama memakai area dan polling yang sama.
 

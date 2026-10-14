@@ -10,11 +10,25 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.routes import decode_polyline
 from app.tracker import Tracker
 from app.upstream import TJClient
 
 MONAS = (-6.1754, 106.8272)
 SOURCE = "rest:/v1/bus/offline"
+
+# Trimmed GET /v2/route/1 response (real shape; polyline is the first points of the real one).
+ROUTE_1 = {
+    "route": {"route_id": "1", "route_short_name": "1", "route_long_name": "Blok M - Kota", "route_desc": "BRT",
+              "route_color": "D62126", "route_text_color": "FFFFFF"},
+    "inbound": {"trip_id": "1-R08", "headsign": "Blok M", "polyline": "bimd@yq|jS@?oEr@",
+                "stops": [{"stop_id": "H00093P", "stop_name": "Kali Besar", "stop_lat": -6.135355, "stop_lon": 106.81143,
+                           "bus_stop_type": "halte"}]},
+    "outbound": {"trip_id": "1-R07", "headsign": "Kali Besar Barat", "polyline": "",
+                 "stops": [{"stop_id": "H00014P", "stop_name": "Blok M", "stop_lat": -6.243312, "stop_lon": 106.80175},
+                           {"stop_id": "H00278P", "stop_name": "Harmoni", "stop_lat": -6.1655, "stop_lon": 106.8205}]},
+    "loop": None,
+}
 
 
 class FakeTJ:
@@ -28,6 +42,7 @@ class FakeTJ:
         self.offline_status = 200
         self.offline_buses: list[dict] = []
         self.user_tokens: set[str] = set()
+        self.route_status = 200
 
     def _tokens(self):
         self.issued += 1
@@ -60,6 +75,10 @@ class FakeTJ:
             if self.offline_status != 200:
                 return httpx.Response(self.offline_status, text="boom")
             return httpx.Response(200, json={"code": 200, "data": self.offline_buses})
+        if path.startswith("/v2/route/"):
+            if self.route_status != 200:
+                return httpx.Response(self.route_status, json={"code": self.route_status, "message": "Rute tidak ditemukan"})
+            return httpx.Response(200, json={"code": 200, "data": ROUTE_1})
         if path == "/v1/user/trips":
             if auth.removeprefix("Bearer ") not in self.user_tokens:
                 return httpx.Response(403, json={"code": 403, "message": "guest"})
@@ -255,6 +274,34 @@ def test_websocket_sends_snapshot_every_interval(client, fake):
 def test_stops_passthrough(client):
     r = client.get("/stops", params={"lat": MONAS[0], "lon": MONAS[1]})
     assert r.json() == [{"stop_id": "S1", "stop_name": "Monas"}]
+
+
+def test_decode_polyline():
+    # Example from Google's polyline algorithm docs.
+    assert decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@") == [[38.5, -120.2], [40.7, -120.95], [43.252, -126.453]]
+    assert decode_polyline("") == []
+
+
+def test_route_detail_normalized_and_cached(client, fake):
+    r = client.get("/routes/1")
+    assert r.status_code == 200
+    body = r.json()
+    assert (body["route_code"], body["route_name"], body["route_color"]) == ("1", "Blok M - Kota", "D62126")
+    outbound, inbound = body["directions"]
+    assert outbound["direction"] == "outbound" and outbound["trip_id"] == "1-R07"
+    # Empty polyline: straight lines between stops.
+    assert outbound["path"] == [[-6.243312, 106.80175], [-6.1655, 106.8205]]
+    assert [s["name"] for s in outbound["stops"]] == ["Blok M", "Harmoni"]
+    assert inbound["path"][0] == [-6.13538, 106.81133] and len(inbound["path"]) == 3
+    client.get("/routes/1")
+    assert fake.paths().count("/v2/route/1") == 1
+
+
+def test_route_detail_errors(client, fake):
+    fake.route_status = 404
+    assert client.get("/routes/XYZ").status_code == 404
+    fake.route_status = 500
+    assert client.get("/routes/ABC").status_code == 502
 
 
 def test_poll_fields(client, fake):
