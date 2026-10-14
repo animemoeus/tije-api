@@ -42,5 +42,8 @@ class Settings(BaseSettings):
     # Route geometry (GET /v2/route/{code}) rarely changes; keep it this long.
     route_cache_seconds: float = 3600.0
 
+    # Serve the map UI (app/static) at /ui. Off: API only, / opens the Swagger docs.
+    serve_ui: bool = False
+
 
 settings = Settings()

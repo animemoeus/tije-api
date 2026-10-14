@@ -42,8 +42,8 @@ copy .env.example .env   # opsional
 .\.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-- UI peta: http://localhost:8000/ (redirect ke `/ui/`)
-- Dokumentasi interaktif: http://localhost:8000/docs
+- Dokumentasi interaktif: http://localhost:8000/docs (`/` diarahkan ke sini)
+- UI peta: http://localhost:8000/ui/, hanya kalau `TJ_SERVE_UI=true`. Secara default UI dimatikan dan server hanya menyajikan API.
 
 ## UI template
 

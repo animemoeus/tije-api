@@ -546,10 +546,17 @@ def test_trips_need_account(client):
     assert client.get("/account/trips").status_code == 403
 
 
-def test_ui_is_served(client):
-    r = client.get("/", follow_redirects=True)
-    assert r.status_code == 200 and "TJ Live Tracking" in r.text
-    assert 'new URL("/ws", API)' in r.text
+def test_ui_off_by_default(client):
+    r = client.get("/", follow_redirects=False)
+    assert r.headers["location"] == "/docs"
+    assert client.get("/ui/").status_code == 404
+
+
+def test_ui_is_served_when_enabled(fake):
+    with make_client(fake, serve_ui=True) as c:
+        r = c.get("/", follow_redirects=True)
+        assert r.status_code == 200 and "TJ Live Tracking" in r.text
+        assert 'new URL("/ws", API)' in r.text
 
 
 def test_health(client):

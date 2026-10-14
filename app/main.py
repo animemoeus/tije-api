@@ -113,15 +113,16 @@ def create_app(
                 log.warning("poll failed: %s", e)
         return entry
 
-    app.mount(
-        "/ui",
-        StaticFiles(directory=Path(__file__).parent / "static", html=True),
-        name="ui",
-    )
+    if settings.serve_ui:
+        app.mount(
+            "/ui",
+            StaticFiles(directory=Path(__file__).parent / "static", html=True),
+            name="ui",
+        )
 
     @app.get("/", include_in_schema=False)
     async def root() -> RedirectResponse:
-        return RedirectResponse("/ui/")
+        return RedirectResponse("/ui/" if settings.serve_ui else "/docs")
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:

@@ -85,8 +85,9 @@ Hentikan server dengan `Ctrl+C`.
 
 | Alamat | Isi |
 |---|---|
-| http://localhost:8000/ | UI peta (redirect ke `/ui/`) |
+| http://localhost:8000/ | Redirect ke `/docs`, atau ke `/ui/` kalau `TJ_SERVE_UI=true` |
 | http://localhost:8000/docs | Swagger UI, bisa mencoba endpoint langsung dari browser |
+| http://localhost:8000/ui/ | UI peta, hanya kalau `TJ_SERVE_UI=true` |
 | http://localhost:8000/redoc | Dokumentasi API versi ReDoc |
 | http://localhost:8000/health | Status server |
 
