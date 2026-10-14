@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TJ Live Tracking</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg: #f5f7fa; --panel: #ffffff; --text: #1f2933; --muted: #6b7785; --border: #e2e6eb;
+      --accent: #174ca1; --ok: #1b7b3a; --warn: #c27c0e; --err: #c62828;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #11151a; --panel: #1a2027; --text: #e6e9ed; --muted: #94a0ad; --border: #2b333c; --accent: #5b8def; }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+      font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .app { display: grid; grid-template-columns: 360px 1fr; height: 100%; }
+    aside { background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+    header { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+    h1 { margin: 0 0 4px; font-size: 17px; }
+    .status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+    .controls { padding: 12px 16px; display: grid; gap: 8px; border-bottom: 1px solid var(--border); }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    label { color: var(--muted); font-size: 12px; }
+    select, input, button { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .hint { color: var(--muted); font-size: 12px; margin: 0; }
+    #routeInput { flex: 1; min-width: 120px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 104px; overflow-y: auto; }
+    .rchip { border: 0; border-radius: 4px; padding: 2px 6px; font: 600 12px system-ui, sans-serif; cursor: pointer; }
+    .rchip small { font-weight: 400; opacity: .85; margin-left: 3px; }
+    .chips.filtering .rchip { opacity: .35; }
+    .chips.filtering .rchip.on { opacity: 1; box-shadow: 0 0 0 2px var(--text); }
+    .list { overflow-y: auto; flex: 1; min-height: 0; }
+    .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
+    .bus { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; display: grid; gap: 4px; }
+    .bus:hover { background: var(--bg); }
+    .bus .top { display: flex; align-items: center; gap: 6px; }
+    .chip { border-radius: 4px; padding: 1px 6px; font-weight: 600; font-size: 12px; }
+    .type { background: var(--accent); color: #fff; }
+    .no { color: var(--muted); font-size: 12px; margin-left: auto; }
+    .next { font-size: 13px; } .meta { color: var(--muted); font-size: 12px; }
+    #map { height: 100%; width: 100%; }
+    .bus-icon { display: flex; align-items: center; justify-content: center; }
+    .bus-icon .pin { position: relative; min-width: 30px; padding: 2px 4px; border-radius: 6px; border: 2px solid #fff;
+      font: 700 11px system-ui, sans-serif; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+    .bus-icon .arrow { position: absolute; left: 50%; top: 50%; width: 0; height: 0;
+      border: 5px solid transparent; border-bottom: 8px solid #174ca1; }
+    @media (max-width: 720px) {
+      .app { grid-template-columns: 1fr; grid-template-rows: 55% 45%; }
+      aside { order: 2; border-right: 0; border-top: 1px solid var(--border); }
+      main { order: 1; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <header>
+      <h1>TJ Live Tracking</h1>
+      <div class="status"><span id="dot" class="dot"></span><span id="status">Memuat…</span></div>
+      <div id="source" class="status" style="margin-top:4px"></div>
+    </header>
+    <div class="controls">
+      <div class="row">
+        <label for="radius">Radius</label>
+        <select id="radius">
+          <option value="0.5">0,5 km</option>
+          <option value="1" selected>1 km</option>
+          <option value="2">2 km</option>
+          <option value="3">3 km</option>
+          <option value="5">5 km</option>
+          <option value="10">10 km</option>
+          <option value="15">15 km</option>
+          <option value="20">20 km</option>
+        </select>
+        <button id="locate">Lokasi saya</button>
+        <button id="stopsBtn">Tampilkan halte</button>
+      </div>
+      <div class="row">
+        <label for="routeInput">Jalur</label>
+        <input id="routeInput" placeholder="mis. 4, 4D, 1" autocomplete="off" />
+        <button id="routeClear">Semua</button>
+      </div>
+      <div id="routeChips" class="chips"></div>
+      <p class="hint">Klik peta untuk memilih titik pantau. Klik kode jalur untuk menyaring.</p>
+    </div>
+    <div id="list" class="list"><div class="empty">Belum ada bus di area ini.</div></div>
+  </aside>
+  <main><div id="map"></div></main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // Same origin as the API by default; override with ?api=http://host:8000
+  const API = new URLSearchParams(location.search).get("api") || location.origin;
+  const BUS_TTL_MS = 5 * 60 * 1000;
+
+  const state = { lat: -6.1754, lon: 106.8272, radius: 1, buses: new Map(), ws: null, retry: 0, stopsLayer: null, routes: new Set() };
+  const $ = (id) => document.getElementById(id);
+
+  // Route filter: exact, case-insensitive codes. Empty set = show every route.
+  const normRoute = (c) => String(c ?? "").trim().toUpperCase();
+  const parseRoutes = (text) => new Set(String(text || "").split(",").map(normRoute).filter(Boolean));
+  const byRoute = (a, b) => a.localeCompare(b, "id", { numeric: true, sensitivity: "base" });
+  const visible = (b) => !state.routes.size || state.routes.has(normRoute(b.route_code));
+  function loadSavedRoutes() {
+    const fromUrl = new URLSearchParams(location.search).get("routes");
+    if (fromUrl != null) return parseRoutes(fromUrl);
+    try { return parseRoutes(localStorage.getItem("tj.routes")); } catch { return new Set(); }
+  }
+  state.routes = loadSavedRoutes();
+
+  const map = L.map("map").setView([state.lat, state.lon], 15);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+  const center = L.marker([state.lat, state.lon]).addTo(map);
+  const circle = L.circle([state.lat, state.lon], { radius: 1000, color: "#174ca1", weight: 1, fillOpacity: 0.05 }).addTo(map);
+  const busLayer = L.layerGroup().addTo(map);
+
+  function setStatus(text, kind) {
+    $("status").textContent = text;
+    $("dot").className = "dot " + (kind || "");
+  }
+
+  function esc(v) {
+    return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function color(hex, fallback) {
+    return /^[0-9a-f]{6}$/i.test(hex || "") ? "#" + hex : fallback;
+  }
+
+  function busIcon(b) {
+    const bg = color(b.route_color, "#174ca1"), fg = color(b.route_text_color, "#ffffff");
+    const rot = Number(b.bearing) || 0;
+    const label = String(b.route_code || "?");
+    const w = Math.max(36, label.length * 8 + 14);
+    return L.divIcon({
+      className: "bus-icon", iconSize: [w, 22], iconAnchor: [w / 2, 11],
+      html: `<div class="pin" style="background:${bg};color:${fg}">${esc(label)}` +
+            // Arrow orbits outside the pin, so it never covers the label.
+      `<span class="arrow" style="margin:-${w / 2 + 12}px 0 0 -5px;transform-origin:5px ${w / 2 + 12}px;transform:rotate(${rot}deg)"></span></div>`,
+    });
+  }
+
+  // "168 m lagi · ETA 2" — upstream sends distance in metres; ETA is often 0 (unknown), so it is shown only when set.
+  function nextInfo(b) {
+    const parts = [];
+    const d = Number(b.estimated_distance_next_stops);
+    if (d > 0) parts.push(d >= 1000 ? `${(d / 1000).toFixed(1)} km lagi` : `${Math.round(d)} m lagi`);
+    const eta = b.estimated_time_next_stops;
+    if (eta && eta !== "0") parts.push(`ETA ${eta}`);
+    return parts.join(" · ");
+  }
+
+  function popupHtml(b) {
+    return `<b>${esc(b.route_code)}</b> ${b.trip_headsign ? "→ " + esc(b.trip_headsign) : ""} · ${esc(b.type)}<br>` +
+           `<small>${esc(b.bus_body_no)}</small><br>` +
+           `Berikutnya: <b>${esc(b.next_stop_name || "-")}</b><br>${esc(nextInfo(b))}`;
+  }
+
+  // Markers of filtered-out routes stay in memory but off the map, so toggling the filter is instant.
+  function syncMarker(entry) {
+    const show = visible(entry.data), on = busLayer.hasLayer(entry.marker);
+    if (show && !on) busLayer.addLayer(entry.marker);
+    else if (!show && on) busLayer.removeLayer(entry.marker);
+  }
+
+  function upsertBus(b) {
+    if (b.latitude == null || b.longitude == null) return;
+    let entry = state.buses.get(b.bus_body_no);
+    if (entry) {
+      entry.data = b; entry.seen = Date.now();
+      entry.marker.setLatLng([b.latitude, b.longitude]).setIcon(busIcon(b)).setPopupContent(popupHtml(b));
+    } else {
+      const marker = L.marker([b.latitude, b.longitude], { icon: busIcon(b) }).bindPopup(popupHtml(b));
+      entry = { data: b, marker, seen: Date.now() };
+      state.buses.set(b.bus_body_no, entry);
+    }
+    syncMarker(entry);
+  }
+
+  function shownCount() {
+    let n = 0;
+    for (const x of state.buses.values()) if (visible(x.data)) n++;
+    return n;
+  }
+
+  function liveStatus() {
+    const total = state.buses.size;
+    return state.routes.size ? `Live · ${shownCount()} dari ${total} bus (jalur ${[...state.routes].sort(byRoute).join(", ")})` : `Live · ${total} bus`;
+  }
+
+  function renderChips() {
+    const counts = new Map();
+    for (const { data: b } of state.buses.values()) {
+      const code = normRoute(b.route_code);
+      if (!code) continue;
+      const c = counts.get(code) || { code: String(b.route_code).trim(), bg: color(b.route_color, "#174ca1"), fg: color(b.route_text_color, "#ffffff"), n: 0 };
+      c.n++; counts.set(code, c);
+    }
+    // Keep selected routes visible as chips even when no bus of that route is in the area right now.
+    for (const code of state.routes) if (!counts.has(code)) counts.set(code, { code, bg: "#6b7785", fg: "#ffffff", n: 0 });
+    const chips = [...counts.entries()].sort((a, b) => byRoute(a[1].code, b[1].code));
+    $("routeChips").classList.toggle("filtering", state.routes.size > 0);
+    $("routeChips").innerHTML = chips.map(([key, c]) =>
+      `<button class="rchip${state.routes.has(key) ? " on" : ""}" data-route="${esc(key)}" style="background:${c.bg};color:${c.fg}"` +
+      ` title="${c.n} bus jalur ${esc(c.code)}">${esc(c.code)}<small>${c.n}</small></button>`).join("");
+  }
+
+  function applyRoutes(routes) {
+    state.routes = routes;
+    $("routeInput").value = [...routes].sort(byRoute).join(", ");
+    try { localStorage.setItem("tj.routes", $("routeInput").value); } catch {}
+    for (const entry of state.buses.values()) syncMarker(entry);
+    if (state.ws && state.ws.readyState === 1) setStatus(liveStatus(), "ok");
+    renderList();
+  }
+
+  $("routeChips").addEventListener("click", (e) => {
+    const chip = e.target.closest(".rchip");
+    if (!chip) return;
+    const next = new Set(state.routes);
+    next.has(chip.dataset.route) ? next.delete(chip.dataset.route) : next.add(chip.dataset.route);
+    applyRoutes(next);
+  });
+  $("routeInput").addEventListener("change", (e) => applyRoutes(parseRoutes(e.target.value)));
+  $("routeInput").addEventListener("keydown", (e) => { if (e.key === "Enter") applyRoutes(parseRoutes(e.target.value)); });
+  $("routeClear").addEventListener("click", () => applyRoutes(new Set()));
+  $("routeInput").value = [...state.routes].sort(byRoute).join(", ");
+
+  function clearBuses() {
+    busLayer.clearLayers();
+    state.buses.clear();
+  }
+
+  // Large radii carry thousands of buses: the map shows all of them, the list only the nearest ones.
+  const LIST_LIMIT = 200;
+
+  function km(d) {
+    return d == null ? "" : d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`;
+  }
+
+  // Coalesce list redraws: updates arrive one bus at a time, often thousands per poll.
+  function scheduleList() {
+    if (state.listTimer) return;
+    state.listTimer = setTimeout(() => {
+      state.listTimer = null;
+      renderList();
+      if (state.ws && state.ws.readyState === 1) setStatus(liveStatus(), "ok");
+    }, 400);
+  }
+
+  function renderList() {
+    renderChips();
+    const items = [...state.buses.values()].map((x) => x.data).filter(visible)
+      .sort((a, b) => (a.distance_km ?? 0) - (b.distance_km ?? 0));
+    if (!items.length) {
+      $("list").innerHTML = state.routes.size && state.buses.size
+        ? `<div class="empty">Tidak ada bus jalur ${esc([...state.routes].sort(byRoute).join(", "))} di area ini.</div>`
+        : '<div class="empty">Belum ada bus di area ini.</div>';
+      return;
+    }
+    const shown = items.slice(0, LIST_LIMIT);
+    const note = items.length > LIST_LIMIT
+      ? `<div class="empty">Menampilkan ${LIST_LIMIT} bus terdekat dari ${items.length}. Semua bus tetap tampil di peta.</div>`
+      : "";
+    $("list").innerHTML = shown.map((b) => {
+      const bg = color(b.route_color, "#174ca1"), fg = color(b.route_text_color, "#ffffff");
+      const dist = km(b.distance_km);
+      return `<div class="bus" data-no="${esc(b.bus_body_no)}">
+        <div class="top"><span class="chip" style="background:${bg};color:${fg}">${esc(b.route_code || "?")}</span>
+          <span class="chip type">${esc(b.type)}</span>${b.trip_headsign ? `<span>→ ${esc(b.trip_headsign)}</span>` : ""}
+          <span class="no">${esc(b.bus_body_no)}</span></div>
+        <div class="next">Berikutnya: <b>${esc(b.next_stop_name || "-")}</b></div>
+        <div class="meta">${esc([nextInfo(b), dist ? dist + " dari titik" : ""].filter(Boolean).join(" · "))}</div>
+      </div>`;
+    }).join("") + note;
+  }
+
+  $("list").addEventListener("click", (e) => {
+    const el = e.target.closest(".bus");
+    const entry = el && state.buses.get(el.dataset.no);
+    if (entry) { map.panTo(entry.marker.getLatLng()); entry.marker.openPopup(); }
+  });
+
+  function connect() {
+    clearTimeout(state.timer);
+    if (state.ws) { state.ws.onclose = null; state.ws.close(); }
+    clearTimeout(state.listTimer); state.listTimer = null;
+    clearBuses(); renderList();
+    const url = new URL("/ws", API);
+    url.protocol = url.protocol.replace("http", "ws");
+    url.search = new URLSearchParams({ lat: state.lat, lon: state.lon, radius_km: state.radius });
+    setStatus("Menghubungkan…", "warn");
+    const ws = new WebSocket(url);
+    state.ws = ws;
+    let serverError = "";
+    ws.onopen = () => setStatus("Terhubung, menunggu posisi bus…", "ok");
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "error") { serverError = msg.detail; setStatus("Error: " + msg.detail, "err"); return; }
+      if (msg.type === "snapshot") { state.retry = 0; msg.buses.forEach(upsertBus); }
+      else if (msg.type === "update") upsertBus(msg.bus);
+      scheduleList();
+    };
+    ws.onclose = () => {
+      // Back off exponentially; after a server-side error wait at least 15 s so we do not hammer upstream.
+      const base = Math.min(60000, 1000 * 2 ** state.retry++);
+      const wait = serverError ? Math.max(15000, base) : base;
+      const why = serverError ? `Error: ${serverError.slice(0, 120)} · ` : "Terputus · ";
+      setStatus(`${why}coba lagi dalam ${Math.round(wait / 1000)} dtk…`, "err");
+      clearTimeout(state.timer);
+      state.timer = setTimeout(connect, wait);
+    };
+  }
+
+  function setCenter(lat, lon) {
+    // Same bounds the API enforces (LAT/LON in app/main.py).
+    if (lat < -7.5 || lat > -5.5 || lon < 106 || lon > 107.5) return setStatus("Titik di luar area Jakarta", "warn");
+    state.lat = +lat.toFixed(6); state.lon = +lon.toFixed(6);
+    center.setLatLng([state.lat, state.lon]);
+    circle.setLatLng([state.lat, state.lon]);
+    if (state.stopsLayer) loadStops();
+    connect();
+  }
+
+  async function loadStops() {
+    if (state.stopsLayer) state.stopsLayer.remove();
+    state.stopsLayer = L.layerGroup().addTo(map);
+    const qs = new URLSearchParams({ lat: state.lat, lon: state.lon, radius_km: state.radius });
+    try {
+      const res = await fetch(new URL("/stops?" + qs, API));
+      if (!res.ok) throw new Error((await res.json()).detail || res.status);
+      const data = await res.json();
+      const stops = Array.isArray(data) ? data : (data?.items || data?.data || []);
+      stops.forEach((s) => {
+        const lat = +(s.stop_lat ?? s.latitude), lon = +(s.stop_lon ?? s.longitude);
+        if (!lat || !lon) return;
+        L.circleMarker([lat, lon], { radius: 5, color: "#174ca1", weight: 2, fillColor: "#fff", fillOpacity: 1 })
+          .bindPopup(`<b>${esc(s.stop_name)}</b><br>${esc(s.bus_stop_type === "halte" ? "Halte" : "Bus stop")}`)
+          .addTo(state.stopsLayer);
+      });
+      $("stopsBtn").textContent = `Sembunyikan halte (${stops.length})`;
+    } catch (err) {
+      setStatus("Gagal memuat halte: " + err.message, "err");
+    }
+  }
+
+  $("stopsBtn").addEventListener("click", () => {
+    if (state.stopsLayer) {
+      state.stopsLayer.remove(); state.stopsLayer = null;
+      $("stopsBtn").textContent = "Tampilkan halte";
+    } else loadStops();
+  });
+
+  $("radius").addEventListener("change", (e) => {
+    state.radius = +e.target.value;
+    circle.setRadius(state.radius * 1000);
+    map.fitBounds(circle.getBounds(), { padding: [20, 20] });
+    if (state.stopsLayer) loadStops();
+    connect();
+  });
+
+  $("locate").addEventListener("click", () => {
+    if (!navigator.geolocation) return setStatus("Browser tidak mendukung GPS", "err");
+    navigator.geolocation.getCurrentPosition(
+      (p) => { map.setView([p.coords.latitude, p.coords.longitude], 15); setCenter(p.coords.latitude, p.coords.longitude); },
+      (err) => setStatus("Lokasi tidak tersedia: " + err.message, "err"),
+    );
+  });
+
+  map.on("click", (e) => setCenter(e.latlng.lat, e.latlng.lng));
+
+  // Drop buses that stopped reporting, like the app does after 5 minutes.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [no, x] of state.buses) {
+      if (now - x.seen > BUS_TTL_MS) { busLayer.removeLayer(x.marker); state.buses.delete(no); }
+    }
+    renderList();
+  }, 30000);
+
+  // Data source + upstream identity, refreshed every 30 s.
+  async function refreshSource() {
+    try {
+      const h = await (await fetch(new URL("/health", API))).json();
+      const who = h.auth.logged_in_as === "user" ? `akun ${h.auth.email}` : h.auth.logged_in_as || "belum login";
+      const src = h.mqtt.connected ? "MQTT realtime" : "polling REST (MQTT tidak terjangkau)";
+      $("source").textContent = `Sumber: ${src} · ${who}${h.auth.last_error ? " · ⚠ " + h.auth.last_error.slice(0, 80) : ""}`;
+    } catch {
+      $("source").textContent = "API tidak bisa dihubungi";
+    }
+  }
+  refreshSource();
+  setInterval(refreshSource, 30000);
+  connect();
+</script>
+</body>
+</html>
