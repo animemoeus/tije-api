@@ -6,6 +6,7 @@
   <title>TJ Live Tracking</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
   <style>
     :root {
       --bg: #f5f7fa; --panel: #ffffff; --text: #1f2933; --muted: #6b7785; --border: #e2e6eb;
@@ -110,6 +111,8 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.22/leaflet-maplibre-gl.js"></script>
 <script>
   // Same origin as the API by default; override with ?api=http://host:8000
   const API = new URLSearchParams(location.search).get("api") || location.origin;
@@ -131,9 +134,20 @@
   state.routes = loadSavedRoutes();
 
   const map = L.map("map").setView([state.lat, state.lon], 15);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
-  }).addTo(map);
+  // Plain OSM vector basemap (OpenFreeMap Positron), labels limited to area names.
+  const gl = L.maplibreGL({
+    style: "https://tiles.openfreemap.org/styles/positron",
+    attribution: '<a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> &copy; OpenStreetMap contributors',
+  }).addTo(map).getMaplibreMap();
+  gl.on("load", () => {
+    for (const l of gl.getStyle().layers) {
+      if (l.type === "symbol" && l["source-layer"] !== "place") gl.setLayoutProperty(l.id, "visibility", "none");
+    }
+    // Positron is grayscale; tint greenery and water softly.
+    gl.setPaintProperty("park", "fill-color", "#dcebd6");
+    gl.setPaintProperty("landcover_wood", "fill-color", "#d6e8cf");
+    gl.setPaintProperty("water", "fill-color", "#c4dcef");
+  });
   const center = L.marker([state.lat, state.lon]).addTo(map);
   const circle = L.circle([state.lat, state.lon], { radius: 1000, color: "#174ca1", weight: 1, fillOpacity: 0.05 }).addTo(map);
   const busLayer = L.layerGroup().addTo(map);
@@ -322,7 +336,7 @@
   const routeCache = new Map(); // code -> Promise<route>
   const MAX_ROUTES_DRAWN = 6;
   const GREY = "#9aa5b1";
-  const BASE_STYLE = { weight: 4, opacity: 0.75 };
+  const BASE_STYLE = { weight: 4, opacity: 0.5 };
 
   async function loadBaseRoutes() {
     try {
@@ -336,15 +350,29 @@
           L.polyline(d.path, { ...BASE_STYLE, color: c, routeColor: c, interactive: false }).addTo(baseLayer);
         }
       }
+      limitMap();
       setFocus(!!state.route);
     } catch (err) {
       setRouteBar(`Gagal memuat rute BRT: ${esc(err.message)}`, true);
     }
   }
 
+  // Keep the view inside a box 5 km beyond the BRT network on every side.
+  function limitMap() {
+    const b = L.latLngBounds([]);
+    baseLayer.eachLayer((l) => b.extend(l.getBounds()));
+    if (!b.isValid()) return;
+    const dLat = 5 / 111.32;
+    const dLon = 5 / (111.32 * Math.cos((b.getCenter().lat * Math.PI) / 180));
+    const box = L.latLngBounds([b.getSouth() - dLat, b.getWest() - dLon], [b.getNorth() + dLat, b.getEast() + dLon]);
+    map.setMaxBounds(box);
+    map.options.maxBoundsViscosity = 1;
+    map.setMinZoom(map.getBoundsZoom(box));
+  }
+
   // Grey out every corridor (and every other bus) while something is highlighted.
   function setFocus(on) {
-    baseLayer.eachLayer((l) => l.setStyle(on ? { color: GREY, opacity: 0.45 } : { color: l.options.routeColor, opacity: BASE_STYLE.opacity }));
+    baseLayer.eachLayer((l) => l.setStyle(on ? { color: GREY, opacity: 0.3 } : { color: l.options.routeColor, opacity: BASE_STYLE.opacity }));
     $("map").classList.toggle("focus", on);
   }
 
@@ -484,7 +512,7 @@
           // popups, because opening a popup would close the bus popup and end the highlight.
           info = { route: r, dir: d, prog };
           const ahead = aheadPath(d, prog);
-          L.polyline(ahead, { color: c, weight: 7, opacity: 0.95, interactive: false }).addTo(routeLayer);
+          L.polyline(ahead, { color: c, weight: 7, opacity: 0.8, interactive: false }).addTo(routeLayer);
           ahead.forEach((p) => bounds.extend(p));
           d.stops.forEach((s, k) => {
             if (k < prog.next || k > prog.end) return;
@@ -494,7 +522,7 @@
           });
           continue;
         }
-        L.polyline(d.path, { color: c, weight: 5, opacity: 0.85, interactive: false }).addTo(routeLayer);
+        L.polyline(d.path, { color: c, weight: 5, opacity: 0.65, interactive: false }).addTo(routeLayer);
         d.path.forEach((p) => bounds.extend(p));
         d.stops.forEach((s, k) => {
           if (seen.has(s.stop_id)) return;
