@@ -9,7 +9,6 @@ Singkatan di diagram:
 - **TJClient**: `app/upstream.py`.
 - **Tracker**: `app/tracker.py`.
 - **tijeapi**: `https://tijeapi.transjakarta.co.id`.
-- **Broker**: `wss://mqtt.tj.co.id:8084/mqtt`.
 
 ## 1. Server dinyalakan
 
@@ -19,26 +18,49 @@ sequenceDiagram
     participant API
     participant TJ as TJClient
     participant TR as Tracker
-    participant T as tijeapi
-    participant B as Broker
 
     U->>API: lifespan start
     API->>TJ: buat TJClient(settings)
-    API->>TR: buat Tracker, pasang event loop
-    API->>API: jalankan tugas latar: prune (30 dtk), polling REST (10 dtk)
-    API->>TJ: _connect_mqtt: get_mqtt_url()
-    TJ->>T: POST /v1/auth/login/guest {}
-    T-->>TJ: token, refresh_token, token_valid_until
-    TJ->>T: GET /v1/settings/api/config/mqtt_url (Bearer)
-    T-->>TJ: data.properties.url = wss://mqtt.tj.co.id:8084/mqtt
-    API->>TR: start(url)
-    TR->>B: connect_async (WebSocket + TLS, client id id_12345)
-    Note over TR,B: Berhasil: on_connect, connected = true<br/>Gagal: paho mencoba lagi (1–30 dtk), connected tetap false
+    API->>TR: buat Tracker(bus_expiry_seconds)
+    API->>API: app.state.areas = {}
+    API->>API: jalankan tugas latar: _prune_loop (30 dtk), _poll_loop (TJ_POLL_SECONDS)
 ```
 
-Kalau langkah login atau `mqtt_url` gagal, `_connect_mqtt` mencoba lagi dengan jeda 5, 10, 20 detik dan seterusnya sampai paling lama 300 detik. Server tetap melayani request selama itu.
+Saat startup backend belum menghubungi upstream sama sekali. Login terjadi pada request pertama yang butuh data dari `tijeapi` (lihat alur 2 dan 6), dan `_poll_loop` tidak melakukan apa pun selama belum ada area dengan client WebSocket.
 
-Request yang dikirim ke upstream pada tahap ini:
+## 2. Client meminta bus di sebuah area
+
+Contoh: `GET /buses?lat=-6.1950&lon=106.8231&radius_km=0.5`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API
+    participant TJ as TJClient
+    participant TR as Tracker
+    participant T as tijeapi
+
+    C->>API: GET /buses?lat&lon&radius_km
+    API->>API: validasi lat, lon, radius
+    API->>API: track_area: cari/buat area (lat, lon dibulatkan 3 desimal, radius)
+    alt polling terakhir area ini < TJ_POLL_SECONDS lalu
+        API->>API: pakai data yang ada
+    else belum pernah atau sudah lebih lama
+        API->>TJ: get_offline_buses(lat, lon, 0.5)
+        TJ->>T: POST /v1/bus/offline {latitude, longitude, radius, event: change_loc}
+        T-->>TJ: daftar posisi bus
+        API->>TR: ingest(posisi, source = rest:/v1/bus/offline)
+    end
+    API->>TR: buses_near(lat, lon, 0.5)
+    TR-->>API: bus dalam radius, urut jarak
+    API-->>C: {count, radius_km, routes, routes_available, buses}
+```
+
+Kalau polling pertama untuk area itu gagal, client menerima 502. Kalau area sudah pernah berhasil di-polling, kegagalan berikutnya hanya dicatat di log dan client menerima data terakhir yang ada.
+
+Area yang hanya diminta lewat `GET /buses` disimpan di `app.state.areas`, tapi tidak di-polling di latar belakang. Area itu dihapus setelah `TJ_AREA_IDLE_SECONDS` (60 detik) tanpa request.
+
+Kalau ini request pertama sejak server dinyalakan, TJClient login dulu sebagai guest (atau dengan akun, lihat [06-autentikasi-upstream.md](06-autentikasi-upstream.md)):
 
 ```http
 POST /v1/auth/login/guest HTTP/1.1
@@ -77,101 +99,16 @@ Accept: application/json
 }
 ```
 
-```http
-GET /v1/settings/api/config/mqtt_url HTTP/1.1
-Host: tijeapi.transjakarta.co.id
-Authorization: Bearer <token>
-X-App-Version: 3.0.4
-...
-```
-
-```json
-{
-  "meta": { "code": 200, "status": "success", "message": "response.success" },
-  "data": {
-    "createdAt": "2025-10-16T04:25:32Z",
-    "isActive": true,
-    "name": "<tidak dicatat>",
-    "properties": { "url": "wss://mqtt.tj.co.id:8084/mqtt" },
-    "updatedAt": "2026-02-23T06:50:57Z"
-  }
-}
-```
-
-## 2. Client meminta bus di sebuah area untuk pertama kali
-
-Contoh: `GET /buses?lat=-6.1950&lon=106.8231&radius_km=0.5`.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant API
-    participant TJ as TJClient
-    participant TR as Tracker
-    participant T as tijeapi
-    participant B as Broker
-
-    C->>API: GET /buses?lat&lon&radius_km
-    API->>API: validasi lat, lon, radius
-    API->>TJ: get_area(lat, lon, 0.5)
-    alt ada di cache (< 60 dtk, kisi ~100 m)
-        TJ-->>API: AreaInfo dari cache
-    else belum ada
-        TJ->>T: POST /v1/bus {latitude, longitude, radius, event: change_loc}
-        T-->>TJ: data.topics, data.buses, data.stops, data.polyline
-        TJ-->>API: AreaInfo(topics, buses)
-    end
-    API->>TR: ingest(buses dari /v1/bus)
-    API->>TR: want_topics(topics)
-    TR->>B: subscribe topik baru (kalau terhubung)
-    API->>API: catat area di app.state.areas
-    opt MQTT tidak terhubung dan area belum di-polling 10 dtk terakhir
-        API->>TJ: get_offline_buses(lat, lon, 0.5)
-        TJ->>T: POST /v1/bus/offline {...}
-        T-->>TJ: daftar posisi bus
-        API->>TR: ingest(posisi, topic = rest:/v1/bus/offline)
-    end
-    API->>TR: buses_near(lat, lon, 0.5)
-    TR-->>API: bus dalam radius, urut jarak
-    opt wait > 0 dan hasil masih kosong
-        API->>TR: cek ulang tiap 0,25 dtk sampai wait habis
-    end
-    API-->>C: {count, radius_km, topics, mqtt_connected, buses}
-```
-
-Request `POST /v1/bus` ke upstream dan response-nya:
+Lalu request posisi bus:
 
 ```http
-POST /v1/bus HTTP/1.1
+POST /v1/bus/offline HTTP/1.1
 Host: tijeapi.transjakarta.co.id
 Authorization: Bearer <token>
 Content-Type: application/json
 
 {"latitude": -6.195, "longitude": 106.8231, "radius": 0.5, "event": "change_loc"}
 ```
-
-```json
-{
-  "code": 200,
-  "message": "success",
-  "session_id": "",
-  "data": {
-    "buses": [],
-    "session_id": "",
-    "polyline": "xzud@s~|jS?o}@o}@?n}@??o}@o}@?~{B~{B?...",
-    "stops": [],
-    "topics": [
-      "/mobile_armada/0016-0020/#",
-      "/mobile_armada/0016-0021/#",
-      "... (6 item total)"
-    ]
-  }
-}
-```
-
-Topik berbentuk `/mobile_armada/<baris>-<kolom>/#`. Angka di tengah adalah sel kisi peta di sekitar titik. Tanda `#` adalah wildcard MQTT, artinya semua sub-topik di sel itu. `polyline` adalah kotak-kotak sel tersebut dalam format Google encoded polyline.
-
-Request `POST /v1/bus/offline` memakai body yang sama. Response-nya berisi posisi bus:
 
 ```json
 {
@@ -216,78 +153,71 @@ sequenceDiagram
     participant C as Client
     participant API
     participant TR as Tracker
-    participant P as Polling REST
-    participant B as Broker
+    participant P as _poll_loop
 
     C->>API: WS /ws?lat&lon&radius_km
     API->>C: accept
     API->>API: track_area(...) seperti alur 2
-    alt upstream gagal
+    alt polling pertama gagal
         API->>C: {"type": "error", "detail": "..."}
         API->>C: close 1011
     else berhasil
-        API->>TR: add_listener(antrean 500)
-        API->>API: mulai _refresh_area (tiap 60 dtk)
-        API->>C: {"type": "snapshot", "buses": [...]}
-        loop selama tersambung
-            alt MQTT terhubung
-                B-->>TR: pesan JSON bus di topik /mobile_armada/...
-            else MQTT tidak terhubung
-                P->>TR: ingest(posisi dari /v1/bus/offline) tiap 10 dtk
-            end
-            TR->>API: item bus (lewat call_soon_threadsafe)
-            API->>API: hitung jarak, buang kalau di luar radius
-            API->>C: {"type": "update", "bus": {...}}
+        API->>API: area.subscribers += 1
+        loop setiap TJ_POLL_SECONDS, jadwal tetap
+            API->>TR: buses_near(lat, lon, radius, routes)
+            API->>C: {"type": "snapshot", "buses": [...]}
+        end
+        par di latar belakang
+            P->>TR: ingest(posisi dari /v1/bus/offline) tiap TJ_POLL_SECONDS
         end
     end
     C--xAPI: tutup koneksi
-    API->>TR: remove_listener
-    API->>API: hentikan _refresh_area
+    API->>API: area.subscribers -= 1
 ```
 
-Update disiarkan ke semua client WebSocket. Setiap handler menyaring sendiri berdasarkan titik dan radius miliknya, jadi client di Blok M tidak menerima bus di Kota.
+Setiap koneksi WebSocket punya dua tugas: satu membaca dari client hanya untuk mengetahui kapan koneksi putus, satu lagi mengirim `snapshot`. Pengiriman memakai jadwal tetap (`next_at += poll_seconds`), jadi waktu yang dipakai untuk mengirim pesan besar tidak menggeser interval.
 
-## 4. Polling REST ketika MQTT tidak tersedia
+Pengiriman `snapshot` tidak menunggu polling. Handler hanya membaca isi Tracker, yang diperbarui oleh `_poll_loop` secara terpisah. Setiap client menyaring sendiri berdasarkan titik, radius, dan filter jalur miliknya, jadi client di Blok M tidak menerima bus di Kota.
 
-Tugas `_rest_poll_loop` berjalan terus di latar belakang:
+## 4. Polling di latar belakang
+
+Tugas `_poll_loop` berjalan terus di latar belakang:
 
 ```mermaid
 flowchart TD
-    A[tidur TJ_REST_POLL_SECONDS] --> B{perlu polling?<br/>auto: MQTT putus<br/>always: selalu<br/>off: tidak pernah}
-    B -- tidak --> A
-    B -- ya --> C[untuk setiap area di app.state.areas]
-    C --> D{area tidak diminta<br/>> TJ_TOPIC_IDLE_SECONDS?}
+    A[tidur TJ_POLL_SECONDS] --> C[untuk setiap area di app.state.areas]
+    C --> S{punya client<br/>WebSocket?}
+    S -- tidak --> D{tidak diminta<br/>> TJ_AREA_IDLE_SECONDS?}
     D -- ya --> E[hapus area]
-    D -- tidak --> F{sudah di-polling<br/>dalam interval ini?}
+    D -- tidak --> C
+    S -- ya --> F{sudah di-polling<br/>dalam interval ini?}
     F -- ya --> C
-    F -- tidak --> G[POST /v1/bus/offline]
-    G --> H[Tracker.ingest]
-    H --> I[siarkan ke WebSocket]
-    I --> C
+    F -- tidak --> G{polling sebelumnya<br/>masih berjalan?}
+    G -- ya --> C
+    G -- tidak --> H[jalankan POST /v1/bus/offline<br/>sebagai tugas terpisah]
+    H --> C
     E --> C
     C -- selesai --> A
 ```
 
-Dalam uji live selama sekitar 70 detik dengan satu client, upstream menerima 1 login guest, 1 `mqtt_url`, 2 `POST /v1/bus`, dan 6 `POST /v1/bus/offline`.
+Polling semua area yang jatuh tempo berjalan paralel. Area yang polling sebelumnya belum selesai (penanda `busy`) dilewati, jadi area yang lambat tidak menumpuk request dan tidak menunda area lain. Hasil polling masuk ke Tracker lewat `ingest`, dan sampai ke client lewat `snapshot` berikutnya.
+
+Bebannya ke upstream: satu request per detik untuk setiap area yang punya client WebSocket (dengan `TJ_POLL_SECONDS=1`). Client yang memilih titik dan radius yang sama berbagi satu polling.
 
 ## 5. Bus diperbarui, kedaluwarsa, dan dibersihkan
 
 ```mermaid
 flowchart LR
-    M[pesan MQTT atau hasil REST] --> V{JSON valid dan<br/>punya bus_body_no?}
+    M[hasil POST /v1/bus/offline] --> V{objek dengan<br/>bus_body_no?}
     V -- tidak --> X[abaikan]
     V -- ya --> O{timestamp lebih lama<br/>dari yang tersimpan?}
     O -- ya --> X
-    O -- tidak --> S[simpan: data, topic, received_at]
-    S --> W[siarkan ke WebSocket]
+    O -- tidak --> S[simpan: data, source, received_at]
 ```
 
-Tugas `_prune_loop` berjalan setiap 30 detik:
+Tugas `_prune_loop` berjalan setiap 30 detik dan menghapus bus dengan `received_at` lebih lama dari `TJ_BUS_EXPIRY_SECONDS` (300 detik). Bus yang keluar dari radius langsung hilang dari `snapshot` berikutnya karena `buses_near` menyaring ulang setiap kali, walaupun datanya masih tersimpan di Tracker sampai kedaluwarsa.
 
-- bus dengan `received_at` lebih lama dari `TJ_BUS_EXPIRY_SECONDS` (300 detik) dihapus;
-- topik yang tidak diminta selama `TJ_TOPIC_IDLE_SECONDS` (600 detik) di-unsubscribe dari broker.
-
-Data REST selalu ber-`timestamp` `"0"`. Karena aturan urutan hanya menolak data yang lebih lama, data REST tetap diterima selama bus itu belum mendapat data MQTT dengan timestamp asli.
+Data REST selalu ber-`timestamp` `"0"`. Karena aturan urutan hanya menolak data yang lebih lama, data baru dengan timestamp yang sama tetap diterima.
 
 ## 6. Token kedaluwarsa
 
@@ -327,7 +257,7 @@ Urutan yang terjadi saat seseorang membuka UI peta dan mengklik dekat Bundaran H
 2. UI memanggil `GET /health` untuk menampilkan sumber data dan status login.
 3. UI membuka `WS /ws?lat=-6.1754&lon=106.8272&radius_km=1` (titik awal Monas).
 4. Pengguna mengklik peta. UI menutup WebSocket lama dan membuka `WS /ws?lat=-6.195&lon=106.8231&radius_km=1`.
-5. Backend memanggil `POST /v1/bus` dan `POST /v1/bus/offline` untuk area baru, lalu mengirim `snapshot`.
-6. Setiap 10 detik backend mem-polling lagi dan mengirim `update` untuk bus yang bergerak. UI memindahkan marker dan mengurutkan ulang daftar.
+5. Backend memanggil `POST /v1/bus/offline` untuk area baru, lalu mulai mengirim `snapshot`.
+6. Setiap detik backend mem-polling area itu lagi dan mengirim `snapshot` baru. UI memindahkan marker yang berubah, menghapus marker bus yang tidak ada lagi di `snapshot`, dan mengurutkan ulang daftar.
 7. Kalau pengguna menekan **Tampilkan halte**, UI memanggil `GET /stops` dan menggambar lingkaran halte.
-8. Bus yang tidak mendapat update selama 5 menit dihapus dari peta oleh UI, dan dari memori oleh backend.
+8. Area lama (Monas) tidak punya client lagi, jadi berhenti di-polling dan dihapus setelah 60 detik. Bus yang tidak mendapat update selama 5 menit dihapus dari memori oleh backend.

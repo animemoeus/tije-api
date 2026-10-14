@@ -1,4 +1,4 @@
-"""Offline tests: fake tijeapi via httpx.MockTransport, fake MQTT via Tracker.handle_message."""
+"""Offline tests: fake tijeapi via httpx.MockTransport."""
 
 import asyncio
 import json
@@ -14,7 +14,7 @@ from app.tracker import Tracker
 from app.upstream import TJClient
 
 MONAS = (-6.1754, 106.8272)
-TOPIC = "/mobile_armada/0014-0020/#"
+SOURCE = "rest:/v1/bus/offline"
 
 
 class FakeTJ:
@@ -54,8 +54,6 @@ class FakeTJ:
         auth = req.headers.get("Authorization", "")
         if auth.removeprefix("Bearer ") not in self.valid:
             return httpx.Response(401, json={"code": 401, "message": "Unauthorized, token is required"})
-        if path == "/v1/bus":
-            return httpx.Response(200, json={"code": 200, "data": {"topics": [TOPIC], "buses": [], "stops": []}})
         if path == "/v2/bus-stop":
             return httpx.Response(200, json={"data": [{"stop_id": "S1", "stop_name": "Monas"}]})
         if path == "/v1/bus/offline":
@@ -66,8 +64,6 @@ class FakeTJ:
             if auth.removeprefix("Bearer ") not in self.user_tokens:
                 return httpx.Response(403, json={"code": 403, "message": "guest"})
             return httpx.Response(200, json={"code": 200, "data": [{"trip_id": "T1"}]})
-        if path == "/v1/settings/api/config/mqtt_url":
-            return httpx.Response(200, json={"data": {"properties": {"url": "wss://mqtt.example:8084/mqtt"}}})
         return httpx.Response(404)
 
     def paths(self):
@@ -75,11 +71,11 @@ class FakeTJ:
 
 
 def bus_msg(no="TJ-001", lat=-6.1760, lon=106.8280, ts=1000, **extra):
-    return json.dumps({
+    return {
         "bus_body_no": no, "latitude": lat, "longitude": lon, "bearing": 90, "timestamp": ts,
         "route_code": "1", "route_color": "D32F2F", "route_text_color": "FFFFFF", "type": "brt",
         "next_stops": "Monas", "estimated_time_next_stops": "2 menit", **extra,
-    }).encode()
+    }
 
 
 @pytest.fixture
@@ -89,41 +85,64 @@ def fake():
 
 @pytest.fixture
 def client(fake):
-    settings = Settings(device_id="test-device", bearer_token="")
+    settings = Settings(_env_file=None, device_id="test-device", bearer_token="", poll_seconds=0.05)
     tj = TJClient(settings, transport=httpx.MockTransport(fake))
-    tracker = Tracker(settings.bus_expiry_seconds, settings.topic_idle_seconds)
-    app = create_app(settings, client=tj, tracker=tracker, start_mqtt=False)
+    tracker = Tracker(settings.bus_expiry_seconds)
+    app = create_app(settings, client=tj, tracker=tracker)
     with TestClient(app) as c:
         c.tracker = tracker
         yield c
 
 
-def test_buses_subscribes_area_and_returns_nearby(client, fake):
-    client.tracker.handle_message(TOPIC, bus_msg())
-    client.tracker.handle_message(TOPIC, bus_msg(no="FAR", lat=-6.30, lon=106.90))
+def make_client(fake, **settings_kw):
+    settings = Settings(_env_file=None, device_id="test-device", bearer_token="", **settings_kw)
+    tj = TJClient(settings, transport=httpx.MockTransport(fake))
+    app = create_app(settings, client=tj, tracker=Tracker(300))
+    return TestClient(app)
+
+
+def nos(msg):
+    return sorted(b["bus_body_no"] for b in msg["buses"])
+
+
+def wait_for(ws, cond, limit=100):
+    """Read snapshots until one matches; returns its bus numbers."""
+    for _ in range(limit):
+        msg = ws.receive_json()
+        assert msg["type"] == "snapshot"
+        if cond(msg):
+            return nos(msg)
+    raise AssertionError("no matching snapshot")
+
+
+def test_buses_polls_area_and_returns_nearby(client, fake):
+    fake.offline_buses = [bus_msg(), bus_msg(no="FAR", lat=-6.30, lon=106.90)]
 
     r = client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 1})
     assert r.status_code == 200
     body = r.json()
-    assert body["topics"] == [TOPIC]
     assert [b["bus_body_no"] for b in body["buses"]] == ["TJ-001"]
-    assert body["buses"][0]["type"] == "BRT"
-    assert TOPIC in client.tracker._topics
+    assert body["buses"][0]["type"] == "BRT" and body["buses"][0]["source"] == SOURCE
 
-    # MQTT is not running in tests, so the first request also polls /v1/bus/offline.
-    assert fake.paths() == ["/v1/auth/login/guest", "/v1/bus", "/v1/bus/offline"]
-    login, req, _ = fake.calls
+    assert fake.paths() == ["/v1/auth/login/guest", "/v1/bus/offline"]
+    login, req = fake.calls
     assert "Authorization" not in login.headers
     assert req.method == "POST" and req.headers["Authorization"] == "Bearer tok1"
     assert json.loads(req.content) == {"latitude": MONAS[0], "longitude": MONAS[1], "radius": 1.0, "event": "change_loc"}
     assert req.headers["X-App-OS"] == "android" and req.headers["X-Device-ID"] == "test-device"
 
 
-def test_topics_and_token_are_reused(client, fake):
+def test_buses_reuses_recent_poll(fake):
+    with make_client(fake, poll_seconds=60) as c:
+        for _ in range(3):
+            c.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1]})
+    assert fake.paths() == ["/v1/auth/login/guest", "/v1/bus/offline"]
+
+
+def test_token_is_reused(client, fake):
     for _ in range(3):
-        client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1]})
-    client.get("/stops", params={"lat": MONAS[0], "lon": MONAS[1]})
-    assert fake.paths() == ["/v1/auth/login/guest", "/v1/bus", "/v1/bus/offline", "/v2/bus-stop"]
+        client.get("/stops", params={"lat": MONAS[0], "lon": MONAS[1]})
+    assert fake.paths() == ["/v1/auth/login/guest"] + ["/v2/bus-stop"] * 3
 
 
 def test_relogin_after_401(client, fake):
@@ -137,7 +156,7 @@ def test_relogin_after_401(client, fake):
 
 def test_expired_token_is_refreshed():
     fake = FakeTJ(ttl=10)  # inside the renewal margin, so the next call renews it
-    tj = TJClient(Settings(bearer_token=""), transport=httpx.MockTransport(fake))
+    tj = TJClient(Settings(_env_file=None, bearer_token=""), transport=httpx.MockTransport(fake))
 
     async def run():
         await tj.get_bus_stops(*MONAS, 1)
@@ -152,60 +171,48 @@ def test_expired_token_is_refreshed():
 def test_static_bearer_token_skips_guest_login():
     fake = FakeTJ()
     fake.valid.add("mine")
-    tj = TJClient(Settings(bearer_token="mine"), transport=httpx.MockTransport(fake))
+    tj = TJClient(Settings(_env_file=None, bearer_token="mine"), transport=httpx.MockTransport(fake))
 
     async def run():
-        assert await tj.get_mqtt_url() == "wss://mqtt.example:8084/mqtt"
+        assert await tj.get_bus_stops(*MONAS, 1) == [{"stop_id": "S1", "stop_name": "Monas"}]
         await tj.aclose()
 
     asyncio.run(run())
-    assert fake.paths() == ["/v1/settings/api/config/mqtt_url"]
-
-
-def test_rest_buses_seed_tracker(client, fake):
-    orig = fake.__call__
-
-    def with_buses(req):
-        if req.url.path == "/v1/bus":
-            fake.calls.append(req)
-            return httpx.Response(200, json={"data": {"topics": [TOPIC], "buses": [json.loads(bus_msg(no="REST-1"))]}})
-        return orig(req)
-
-    client.app.state.client._http._transport = httpx.MockTransport(with_buses)
-    body = client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1]}).json()
-    assert [b["bus_body_no"] for b in body["buses"]] == ["REST-1"]
+    assert fake.paths() == ["/v2/bus-stop"]
 
 
 def test_snapped_position_and_out_of_order_updates(client):
     t = client.tracker
-    t.handle_message(TOPIC, bus_msg(ts=2000, snap_latitude=-6.1755, snap_longitude=106.8273))
-    t.handle_message(TOPIC, bus_msg(ts=1500, lat=-6.0, lon=106.0))  # older, ignored
+    t.ingest([bus_msg(ts=2000, snap_latitude=-6.1755, snap_longitude=106.8273)], SOURCE)
+    t.ingest([bus_msg(ts=1500, lat=-6.0, lon=106.0)], SOURCE)  # older, ignored
     b = client.get("/buses/TJ-001").json()
     assert (b["latitude"], b["longitude"], b["timestamp"]) == (-6.1755, 106.8273, 2000)
 
 
 def test_bus_not_found_and_bad_payload(client):
-    client.tracker.handle_message(TOPIC, b"not json")
+    client.tracker.ingest(["not a bus", {"no_body_no": 1}], SOURCE)
     assert client.get("/buses/NOPE").status_code == 404
 
 
 def test_validation_and_upstream_errors(client, fake):
     fake.offline_status = 500
     assert client.get("/buses", params={"lat": 51.5, "lon": 0.1}).status_code == 422
-    r = client.get("/buses/offline", params={"lat": MONAS[0], "lon": MONAS[1]})
-    assert r.status_code == 502
+    assert client.get("/buses/offline", params={"lat": MONAS[0], "lon": MONAS[1]}).status_code == 502
+    assert client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1]}).status_code == 502
+    with client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}") as ws:
+        assert ws.receive_json()["type"] == "error"
 
 
 def test_radius_capped_at_max(client, fake):
     assert client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 20}).json()["radius_km"] == 20
     assert client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 50}).json()["radius_km"] == 20
-    sent = [json.loads(c.content)["radius"] for c in fake.calls if c.url.path == "/v1/bus"]
-    assert sent == [20.0]  # second request hits the (lat, lon, 20) topic cache
+    sent = {json.loads(c.content)["radius"] for c in fake.calls if c.url.path == "/v1/bus/offline"}
+    assert sent == {20.0}
 
 
-def test_route_filter(client):
-    for no, route in [("A", "4"), ("B", "4D"), ("C", "10"), ("D", "4"), ("E", "JAK.10")]:
-        client.tracker.handle_message(TOPIC, bus_msg(no=no, route_code=route))
+def test_route_filter(client, fake):
+    fake.offline_buses = [bus_msg(no=no, route_code=route)
+                          for no, route in [("A", "4"), ("B", "4D"), ("C", "10"), ("D", "4"), ("E", "JAK.10")]]
     body = client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1], "routes": " 4, 4d "}).json()
     assert sorted(b["bus_body_no"] for b in body["buses"]) == ["A", "B", "D"]
     assert body["routes"] == ["4", "4D"] and body["count"] == 3
@@ -215,25 +222,34 @@ def test_route_filter(client):
     assert body["count"] == 5 and body["routes"] is None
 
 
-def test_unchanged_bus_is_not_rebroadcast(client):
-    with client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}") as ws:
-        ws.receive_json()  # snapshot
-        client.tracker.handle_message(TOPIC, bus_msg(no="A"))
-        client.tracker.handle_message(TOPIC, bus_msg(no="A"))           # identical: refreshes age only
-        client.tracker.handle_message(TOPIC, bus_msg(no="A", lat=-6.1761))  # moved
-        assert ws.receive_json()["bus"]["latitude"] == -6.176
-        assert ws.receive_json()["bus"]["latitude"] == -6.1761
-    assert client.get("/buses/A").json()["age_seconds"] < 5
-
-
-def test_websocket_route_filter(client):
-    client.tracker.handle_message(TOPIC, bus_msg(no="A", route_code="4"))
-    client.tracker.handle_message(TOPIC, bus_msg(no="B", route_code="1"))
+def test_websocket_route_filter(client, fake):
+    fake.offline_buses = [bus_msg(no="A", route_code="4"), bus_msg(no="B", route_code="1")]
     with client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&routes=4D,4") as ws:
-        assert [b["bus_body_no"] for b in ws.receive_json()["buses"]] == ["A"]
-        client.tracker.handle_message(TOPIC, bus_msg(no="B", route_code="1", ts=1001))   # filtered out
-        client.tracker.handle_message(TOPIC, bus_msg(no="C", route_code="4d", ts=1001))  # case-insensitive
-        assert ws.receive_json()["bus"]["bus_body_no"] == "C"
+        assert nos(ws.receive_json()) == ["A"]
+        fake.offline_buses = [bus_msg(no="B", route_code="1", ts=1001), bus_msg(no="C", route_code="4d", ts=1001)]
+        assert wait_for(ws, lambda m: "C" in nos(m)) == ["A", "C"]  # 4d matches case-insensitively, B never shows
+
+
+def test_websocket_sends_snapshot_every_interval(client, fake):
+    fake.offline_buses = [bus_msg(no="A"), bus_msg(no="FAR", lat=-6.30, lon=106.90)]
+    with client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&radius_km=1") as ws:
+        start = time.monotonic()
+        snaps = [ws.receive_json() for _ in range(4)]
+        assert all(m["type"] == "snapshot" and nos(m) == ["A"] for m in snaps)
+        assert time.monotonic() - start >= 3 * 0.05 * 0.8  # paced by poll_seconds, not sent back to back
+        assert snaps[0]["buses"][0]["distance_km"] < 1
+
+        # Upstream moves A and adds B: later snapshots follow.
+        fake.offline_buses = [bus_msg(no="A", lat=-6.1761, ts=1001), bus_msg(no="B", ts=1001)]
+        wait_for(ws, lambda m: nos(m) == ["A", "B"] and -6.1761 in [b["raw_latitude"] for b in m["buses"]])
+        # B drives out of the radius.
+        fake.offline_buses = [bus_msg(no="B", lat=-6.30, lon=106.90, ts=1002)]
+        assert wait_for(ws, lambda m: "B" not in nos(m)) == ["A"]
+    for _ in range(50):  # the server notices the disconnect asynchronously
+        if client.get("/health").json()["tracker"]["ws_clients"] == 0:
+            break
+        time.sleep(0.02)
+    assert client.get("/health").json()["tracker"]["ws_clients"] == 0
 
 
 def test_stops_passthrough(client):
@@ -241,31 +257,13 @@ def test_stops_passthrough(client):
     assert r.json() == [{"stop_id": "S1", "stop_name": "Monas"}]
 
 
-def test_websocket_snapshot_then_updates(client):
-    client.tracker.handle_message(TOPIC, bus_msg(no="A"))
-    with client.websocket_connect(f"/ws?lat={MONAS[0]}&lon={MONAS[1]}&radius_km=1") as ws:
-        snap = ws.receive_json()
-        assert snap["type"] == "snapshot" and [b["bus_body_no"] for b in snap["buses"]] == ["A"]
-        client.tracker.handle_message(TOPIC, bus_msg(no="FAR", lat=-6.30, lon=106.90))  # filtered out
-        client.tracker.handle_message(TOPIC, bus_msg(no="B", ts=1001))
-        upd = ws.receive_json()
-        assert upd["type"] == "update" and upd["bus"]["bus_body_no"] == "B"
-
-
-def make_client(fake, **settings_kw):
-    settings = Settings(device_id="test-device", bearer_token="", **settings_kw)
-    tj = TJClient(settings, transport=httpx.MockTransport(fake))
-    app = create_app(settings, client=tj, tracker=Tracker(300, 600), start_mqtt=False)
-    return TestClient(app)
-
-
-def test_rest_poll_fills_buses_when_mqtt_down(client, fake):
-    fake.offline_buses = [json.loads(bus_msg(no="MYS-17084", ts="0", next_stops="H00251P-Tosari",
-                                              prev_stops="H00022P-Bundaran HI Astra", estimated_distance_next_stops=168,
-                                              trip_headsign="Blok M", route_name="Blok M"))]
+def test_poll_fields(client, fake):
+    fake.offline_buses = [bus_msg(no="MYS-17084", ts="0", next_stops="H00251P-Tosari",
+                                  prev_stops="H00022P-Bundaran HI Astra", estimated_distance_next_stops=168,
+                                  trip_headsign="Blok M", route_name="Blok M")]
     body = client.get("/buses", params={"lat": MONAS[0], "lon": MONAS[1]}).json()
     b = body["buses"][0]
-    assert b["bus_body_no"] == "MYS-17084" and b["topic"] == "rest:/v1/bus/offline"
+    assert b["bus_body_no"] == "MYS-17084" and b["source"] == SOURCE
     assert (b["next_stop_name"], b["prev_stop_name"], b["trip_headsign"]) == ("Tosari", "Bundaran HI Astra", "Blok M")
 
 
@@ -302,5 +300,6 @@ def test_ui_is_served(client):
 
 def test_health(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok" and body["mqtt"]["connected"] is False
+    assert body["status"] == "ok"
+    assert body["tracker"] == {"buses": 0, "areas": 0, "ws_clients": 0, "poll_seconds": 0.05}
     assert body["auth"]["mode"] == "guest"

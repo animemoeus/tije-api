@@ -76,7 +76,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
   "prev_stop_name": "Monumen Nasional",
   "estimated_time_next_stops": 0,
   "estimated_distance_next_stops": 1626,
-  "topic": "rest:/v1/bus/offline",
+  "source": "rest:/v1/bus/offline",
   "age_seconds": 0.0,
   "distance_km": 0.054
 }
@@ -86,7 +86,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
 |---|---|---|---|
 | `bus_body_no` | string | upstream | Nomor badan bus, unik per kendaraan. Dipakai sebagai ID |
 | `route_code` | string | upstream | Kode rute/koridor, misalnya `1`, `4C`, `JAK.10` |
-| `route_name` | string \| null | upstream | Nama rute. Dari MQTT bisa tidak ada |
+| `route_name` | string \| null | upstream | Nama rute |
 | `trip_headsign` | string \| null | upstream | Tujuan akhir perjalanan saat ini |
 | `route_color` | string | upstream | Warna rute dalam hex tanpa `#` |
 | `route_text_color` | string | upstream | Warna teks di atas warna rute |
@@ -101,7 +101,7 @@ Endpoint `/buses`, `/buses/{bus_body_no}`, dan `/ws` mengembalikan objek bus den
 | `prev_stop_name` | string \| null | turunan | Nama halte sebelumnya, dari `prev_stops` |
 | `estimated_time_next_stops` | number \| string | upstream | Perkiraan waktu ke halte berikutnya. Sering bernilai 0, artinya tidak diketahui |
 | `estimated_distance_next_stops` | number \| null | upstream | Jarak ke halte berikutnya dalam meter |
-| `topic` | string | backend | Asal data: nama topik MQTT, `rest:/v1/bus/offline`, atau `rest:/v1/bus` |
+| `source` | string | backend | Asal data. Saat ini selalu `rest:/v1/bus/offline` |
 | `age_seconds` | number | backend | Sudah berapa detik sejak backend menerima data bus ini |
 | `distance_km` | number | backend | Jarak dari titik yang diminta. Tidak ada di `GET /buses/{bus_body_no}` |
 
@@ -111,7 +111,7 @@ Kode halte berawalan `H` untuk halte BRT dan `B` untuk bus stop biasa, contohnya
 
 ## `GET /health`
 
-Status server, login upstream, dan koneksi MQTT. Cocok untuk monitoring.
+Status server, login upstream, dan pemantauan area. Cocok untuk monitoring.
 
 **Request**
 
@@ -132,13 +132,11 @@ curl http://localhost:8000/health
     "valid_until": 1791987415,
     "last_error": null
   },
-  "mqtt": {
-    "connected": false,
-    "broker_url": "wss://mqtt.tj.co.id:8084/mqtt",
+  "tracker": {
     "buses": 3,
-    "topics": 4,
-    "subscribed": 0,
-    "listeners": 1
+    "areas": 1,
+    "ws_clients": 1,
+    "poll_seconds": 1.0
   }
 }
 ```
@@ -146,12 +144,10 @@ curl http://localhost:8000/health
 | Field | Keterangan |
 |---|---|
 | `auth` | Sama dengan `GET /account` |
-| `mqtt.connected` | `true` kalau broker MQTT terhubung |
-| `mqtt.broker_url` | Alamat broker yang dipakai. Kosong kalau backend belum berhasil mendapatkannya |
-| `mqtt.buses` | Jumlah bus yang sedang disimpan di memori (dari semua area) |
-| `mqtt.topics` | Jumlah topik yang sedang diminati client |
-| `mqtt.subscribed` | Jumlah topik yang benar-benar sudah di-subscribe ke broker |
-| `mqtt.listeners` | Jumlah client WebSocket yang tersambung |
+| `tracker.buses` | Jumlah bus yang sedang disimpan di memori (dari semua area) |
+| `tracker.areas` | Jumlah area yang sedang dikenal backend (punya client WebSocket, atau diminta lewat `/buses` dalam 60 detik terakhir) |
+| `tracker.ws_clients` | Jumlah client WebSocket yang tersambung, dijumlahkan dari semua area |
+| `tracker.poll_seconds` | Interval polling dan pengiriman `snapshot` (`TJ_POLL_SECONDS`) |
 
 ---
 
@@ -159,7 +155,7 @@ curl http://localhost:8000/health
 
 Daftar bus di sekitar sebuah titik, diurutkan dari yang terdekat.
 
-Panggilan pertama untuk sebuah area membuat backend mulai memantau area itu: mengambil topik dari upstream, subscribe ke MQTT, dan (kalau MQTT tidak tersedia) langsung mengambil posisi lewat REST. Panggilan berikutnya dalam 60 detik memakai cache.
+Kalau data area itu lebih tua dari `TJ_POLL_SECONDS` (bawaan 1 detik), atau area belum pernah diminta, backend memanggil `POST /v1/bus/offline` saat itu juga sebelum menjawab. Kalau masih segar, misalnya karena ada client WebSocket di area yang sama, backend langsung menjawab dari cache. Area yang hanya diminta lewat `/buses` dilupakan setelah 60 detik tanpa request (`TJ_AREA_IDLE_SECONDS`).
 
 **Parameter query**
 
@@ -169,7 +165,6 @@ Panggilan pertama untuk sebuah area membuat backend mulai memantau area itu: men
 | `lon` | ya | number | | Bujur titik pusat |
 | `radius_km` | tidak | number | 1 | Radius pencarian, maksimal 20 |
 | `routes` | tidak | string | | Hanya jalur ini, dipisah koma, misalnya `4,4D` |
-| `wait` | tidak | number | 0 | Kalau belum ada bus di cache, tunggu sampai sekian detik (0–10) untuk posisi pertama |
 
 **Request**
 
@@ -189,12 +184,6 @@ curl "http://localhost:8000/buses?lat=-6.1950&lon=106.8231&radius_km=0.5"
     { "route_code": "4C", "route_color": "553C62", "route_text_color": "FFFFFF", "count": 1 },
     "... (3 item total)"
   ],
-  "topics": [
-    "/mobile_armada/0017-0020/#",
-    "/mobile_armada/0017-0021/#",
-    "... (4 item total)"
-  ],
-  "mqtt_connected": false,
   "buses": [
     {
       "bus_body_no": "MYS-17022",
@@ -216,7 +205,7 @@ curl "http://localhost:8000/buses?lat=-6.1950&lon=106.8231&radius_km=0.5"
       "prev_stop_name": "Monumen Nasional",
       "estimated_time_next_stops": 0,
       "estimated_distance_next_stops": 1626,
-      "topic": "rest:/v1/bus/offline",
+      "source": "rest:/v1/bus/offline",
       "age_seconds": 0.0,
       "distance_km": 0.054
     },
@@ -240,7 +229,7 @@ curl "http://localhost:8000/buses?lat=-6.1950&lon=106.8231&radius_km=0.5"
       "prev_stop_name": "Tosari 2",
       "estimated_time_next_stops": 0,
       "estimated_distance_next_stops": 230,
-      "topic": "rest:/v1/bus/offline",
+      "source": "rest:/v1/bus/offline",
       "age_seconds": 0.0,
       "distance_km": 0.059
     }
@@ -254,8 +243,6 @@ curl "http://localhost:8000/buses?lat=-6.1950&lon=106.8231&radius_km=0.5"
 | `radius_km` | Radius yang benar-benar dipakai (setelah dipotong ke batas maksimal) |
 | `routes` | Filter jalur yang dipakai, dalam huruf besar dan terurut, atau `null` kalau tanpa filter |
 | `routes_available` | Semua jalur yang ada di radius ini **sebelum** filter, dengan warna dan jumlah bus, urut alami (1, 1A, 2, 4, 4D, 10, JAK.10). Berguna untuk membuat pilihan filter |
-| `topics` | Topik MQTT untuk area ini menurut upstream |
-| `mqtt_connected` | Status broker saat request diproses |
 | `buses` | Daftar [objek bus](#objek-bus) |
 
 ### Menyaring jalur
@@ -273,8 +260,6 @@ curl "http://localhost:8000/buses?lat=-6.1950&lon=106.8231&radius_km=20&routes=4
     { "route_code": "1", "route_color": "D62126", "route_text_color": "FFFFFF", "count": 40 },
     "... (212 item total)"
   ],
-  "topics": ["... (1332 item total)"],
-  "mqtt_connected": false,
   "buses": ["... 23 objek bus jalur 4 dan 4D, urut jarak"]
 }
 ```
@@ -285,8 +270,8 @@ Angka di atas dari uji live 13 Oktober 2026 (radius 20 km di sekitar Bundaran HI
 
 | Kode | Kapan |
 |---|---|
-| 422 | `lat`/`lon` tidak ada, bukan angka, atau di luar batas; `radius_km` ≤ 0; `wait` di luar 0–10 |
-| 502 | Upstream menolak `POST /v1/bus`, misalnya `{"detail": "upstream error: POST /v1/bus: HTTP 401 ..."}` |
+| 422 | `lat`/`lon` tidak ada, bukan angka, atau di luar batas; `radius_km` ≤ 0 |
+| 502 | Polling pertama untuk area ini gagal, misalnya `{"detail": "upstream error: POST /v1/bus/offline: HTTP 500 ..."}`. Kalau area sudah pernah berhasil di-polling, kegagalan berikutnya hanya dicatat di log dan backend menjawab dengan data terakhir yang ada |
 
 Contoh 422 untuk koordinat London:
 
@@ -350,7 +335,7 @@ curl http://localhost:8000/buses/MYS-17022
   "prev_stop_name": "Monumen Nasional",
   "estimated_time_next_stops": 0,
   "estimated_distance_next_stops": 1626,
-  "topic": "rest:/v1/bus/offline",
+  "source": "rest:/v1/bus/offline",
   "age_seconds": 0.1
 }
 ```
@@ -369,7 +354,7 @@ curl http://localhost:8000/buses/NOPE-1
 
 ## `GET /buses/offline`
 
-Meneruskan `POST /v1/bus/offline` dari upstream apa adanya (isi field `data`). Berguna untuk melihat data mentah, termasuk field yang tidak dipakai backend seperti `trip_id`, `livery`, dan `curr_stops`. Endpoint ini tidak memengaruhi cache atau pemantauan area.
+Meneruskan `POST /v1/bus/offline` dari upstream apa adanya (isi field `data`). Berguna untuk melihat data mentah, termasuk field yang tidak dipakai backend seperti `trip_id`, `livery`, dan `curr_stops`. Endpoint ini selalu memanggil upstream dan tidak memengaruhi cache atau pemantauan area.
 
 **Parameter query**: `lat`, `lon`, `radius_km`, aturannya sama dengan `/buses`.
 
@@ -583,9 +568,9 @@ Isinya response asli upstream. Bentuk persisnya tergantung akun dan belum dicata
 
 ## `WS /ws`
 
-Aliran posisi bus untuk satu area. Client menerima satu pesan `snapshot` berisi semua bus yang sudah diketahui, lalu satu pesan `update` setiap ada bus di dalam radius yang posisinya berubah.
+Aliran posisi bus untuk satu area. Setelah koneksi diterima, client menerima pesan `snapshot` berisi semua bus di dalam radius, diurutkan dari yang terdekat, lalu `snapshot` baru setiap `TJ_POLL_SECONDS` (bawaan 1 detik) dengan jadwal tetap.
 
-**Parameter query**: `lat`, `lon`, `radius_km`, dan `routes`, aturannya sama dengan `/buses`. Dengan `routes`, `snapshot` dan `update` hanya berisi jalur itu.
+**Parameter query**: `lat`, `lon`, `radius_km`, dan `routes`, aturannya sama dengan `/buses`. Dengan `routes`, `snapshot` hanya berisi jalur itu.
 
 **URL**
 
@@ -593,11 +578,11 @@ Aliran posisi bus untuk satu area. Client menerima satu pesan `snapshot` berisi 
 ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5
 ```
 
-Selama koneksi terbuka, backend memperbarui topik area itu setiap 60 detik dan (kalau MQTT tidak tersedia) mem-polling posisinya setiap 10 detik.
+Selama koneksi terbuka, backend mem-polling `POST /v1/bus/offline` untuk area itu setiap `TJ_POLL_SECONDS`. Semua client di area yang sama (titik dibulatkan ke 3 desimal, radius sama) berbagi satu polling.
 
 ### Pesan dari server
 
-**`snapshot`**, dikirim sekali setelah koneksi diterima:
+**`snapshot`**, dikirim langsung setelah koneksi diterima lalu berulang setiap `TJ_POLL_SECONDS`:
 
 ```json
 {
@@ -623,7 +608,7 @@ Selama koneksi terbuka, backend memperbarui topik area itu setiap 60 detik dan (
       "prev_stop_name": "Monumen Nasional",
       "estimated_time_next_stops": 0,
       "estimated_distance_next_stops": 1626,
-      "topic": "rest:/v1/bus/offline",
+      "source": "rest:/v1/bus/offline",
       "age_seconds": 0.2,
       "distance_km": 0.054
     },
@@ -632,53 +617,23 @@ Selama koneksi terbuka, backend memperbarui topik area itu setiap 60 detik dan (
 }
 ```
 
-**`update`**, satu bus berubah posisi:
-
-```json
-{
-  "type": "update",
-  "bus": {
-    "bus_body_no": "DMR-230106",
-    "route_code": "4C",
-    "route_name": "JIEP",
-    "trip_headsign": "JIEP",
-    "route_color": "553C62",
-    "route_text_color": "FFFFFF",
-    "type": "Non-BRT",
-    "latitude": -6.194908,
-    "longitude": 106.823551,
-    "raw_latitude": -6.194908,
-    "raw_longitude": 106.823551,
-    "bearing": 162,
-    "speed": 0,
-    "timestamp": "0",
-    "next_stops": "B00790P-Imam Bonjol",
-    "next_stop_name": "Imam Bonjol",
-    "prev_stop_name": "Tosari 2",
-    "estimated_time_next_stops": 0,
-    "estimated_distance_next_stops": 165,
-    "topic": "rest:/v1/bus/offline",
-    "age_seconds": 0.0,
-    "distance_km": 0.051
-  }
-}
-```
-
-**`error`**, dikirim kalau backend gagal mendaftarkan area (misalnya upstream menolak). Setelah pesan ini server menutup koneksi dengan kode 1011.
+**`error`**, dikirim kalau polling pertama untuk area itu gagal (misalnya upstream menolak). Setelah pesan ini server menutup koneksi dengan kode 1011.
 
 ```json
 {
   "type": "error",
-  "detail": "upstream error: POST /v1/bus: HTTP 401 {\"code\":401,\"message\":\"Unauthorized, token is required\",\"data\":{\"type\":\"PopUp\"}}\n"
+  "detail": "upstream error: POST /v1/bus/offline: HTTP 500 boom"
 }
 ```
 
 ### Perilaku yang perlu diketahui
 
-- Bus yang keluar dari radius tidak dikirimi pesan "hapus". Client sebaiknya membuang bus yang tidak mendapat update selama beberapa menit. UI bawaan memakai 5 menit.
-- Hanya bus yang datanya berubah yang dikirim sebagai `update`. Polling REST mengulang semua bus setiap 10 detik, tetapi bus yang diam tidak dikirim ulang.
-- Kalau client terlalu lambat membaca, antrean per client dibatasi 10.000 pesan (cukup untuk beberapa polling radius 20 km). Pesan terlama dibuang lebih dulu.
+- Setiap `snapshot` adalah daftar lengkap. Bus yang tidak ada di `snapshot` terbaru sudah keluar dari radius (atau sudah lebih dari 5 menit tidak terlihat), jadi client cukup mengganti seluruh datanya dengan isi `snapshot` terakhir. Tidak ada pesan "hapus" terpisah.
+- `snapshot` dikirim dengan jadwal tetap setiap `TJ_POLL_SECONDS`, walaupun tidak ada yang berubah. Bus yang diam tetap dikirim ulang dengan data yang sama.
+- Polling upstream untuk area itu berjalan terpisah dari pengiriman `snapshot`. Kalau polling gagal atau lambat, `snapshot` tetap dikirim berisi data terakhir yang ada, dan `age_seconds` setiap bus terus bertambah.
+- Ukuran pesan sebanding dengan jumlah bus di radius. Pada radius 20 km satu `snapshot` berisi sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client.
 - Parameter yang tidak valid membuat handshake ditolak (kode 1008 menurut Starlette) sebelum `snapshot` dikirim.
+- Client tidak perlu mengirim apa pun. Pesan dari client diabaikan.
 - Untuk pindah area, tutup koneksi lalu buka koneksi baru dengan koordinat baru.
 
 ### Contoh client
@@ -687,13 +642,12 @@ JavaScript (browser atau Node 22+):
 
 ```js
 const ws = new WebSocket("ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5");
-const buses = new Map();
+let buses = new Map();
 
 ws.onmessage = (event) => {
   const msg = JSON.parse(event.data);
-  if (msg.type === "snapshot") msg.buses.forEach((b) => buses.set(b.bus_body_no, b));
-  if (msg.type === "update") buses.set(msg.bus.bus_body_no, msg.bus);
-  if (msg.type === "error") console.error(msg.detail);
+  if (msg.type === "error") return console.error(msg.detail);
+  if (msg.type === "snapshot") buses = new Map(msg.buses.map((b) => [b.bus_body_no, b]));
   console.log(`${buses.size} bus`);
 };
 ```
@@ -708,11 +662,11 @@ async def main():
     async with websockets.connect(url) as ws:
         async for raw in ws:
             msg = json.loads(raw)
-            if msg["type"] == "snapshot":
-                print("awal:", len(msg["buses"]), "bus")
-            elif msg["type"] == "update":
-                b = msg["bus"]
-                print(b["route_code"], b["bus_body_no"], "->", b["next_stop_name"])
+            if msg["type"] == "error":
+                print("error:", msg["detail"])
+            elif msg["type"] == "snapshot":
+                nearest = msg["buses"][:3]
+                print(len(msg["buses"]), "bus;", ", ".join(f'{b["route_code"]} {b["bus_body_no"]}' for b in nearest))
 
 asyncio.run(main())
 ```
@@ -731,7 +685,7 @@ Python dengan `httpx`:
 import httpx
 
 with httpx.Client(base_url="http://localhost:8000") as api:
-    r = api.get("/buses", params={"lat": -6.1950, "lon": 106.8231, "radius_km": 0.5, "wait": 3})
+    r = api.get("/buses", params={"lat": -6.1950, "lon": 106.8231, "radius_km": 0.5})
     r.raise_for_status()
     for bus in r.json()["buses"]:
         print(f'{bus["route_code"]:>6} {bus["bus_body_no"]:<12} {bus["distance_km"] * 1000:5.0f} m  → {bus["next_stop_name"]}')

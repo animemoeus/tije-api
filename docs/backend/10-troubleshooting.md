@@ -1,9 +1,9 @@
 # Troubleshooting
 
-## Peta kosong, status "Error: upstream error: POST /v1/bus: HTTP 401"
+## Peta kosong, status "Error: upstream error: POST /v1/bus/offline: HTTP 401"
 
 ```json
-{"type":"error","detail":"upstream error: POST /v1/bus: HTTP 401 {\"code\":401,\"message\":\"Unauthorized, token is required\",\"data\":{\"type\":\"PopUp\"}}\n"}
+{"type":"error","detail":"upstream error: POST /v1/bus/offline: HTTP 401 {\"code\":401,\"message\":\"Unauthorized, token is required\",\"data\":{\"type\":\"PopUp\"}}\n"}
 ```
 
 Server yang berjalan masih versi lama yang belum punya login guest. Hentikan server (`Ctrl+C`) dan jalankan lagi. Setelah restart, log harus memuat `logged in as guest`.
@@ -13,33 +13,13 @@ Kalau masih 401 setelah restart:
 - `TJ_BEARER_TOKEN` di `.env` mungkin sudah kedaluwarsa. Hapus baris itu.
 - Upstream mungkin mengubah aturan login. Cek dengan `curl -X POST https://tijeapi.transjakarta.co.id/v1/auth/login/guest -H "Content-Type: application/json" -d "{}"`.
 
-## `/health` menunjukkan `"connected": false` terus
-
-Broker MQTT tidak bisa dihubungi. Saat pengembangan, `mqtt.tj.co.id` (103.145.125.134) tidak menjawab di port mana pun dari jaringan pengembang:
-
-```powershell
-Test-NetConnection mqtt.tj.co.id -Port 8084
-```
-
-```
-TcpTestSucceeded : False
-```
-
-Ini bukan kesalahan backend. Kemungkinannya broker hanya menerima koneksi dari jaringan tertentu, misalnya operator seluler Indonesia. Selama itu terjadi, backend memakai polling REST (`TJ_REST_POLL=auto`) dan peta tetap berisi data, hanya saja update datang setiap 10 detik, bukan realtime.
-
-Hal yang bisa dicoba:
-
-- jalankan backend di jaringan lain (tethering HP dengan kartu Indonesia, server di Indonesia);
-- pastikan firewall atau proxy kantor tidak memblokir port 8084;
-- kalau broker bisa dijangkau di alamat lain, isi `TJ_MQTT_URL`.
-
 ## Daftar bus kosong padahal ada bus di jalan
 
-- Cek `/health`. Kalau `mqtt.connected` false dan `auth.has_token` false, backend belum berhasil login. Lihat log.
-- Polling REST dimatikan (`TJ_REST_POLL=off`) sementara MQTT tidak terhubung. Kembalikan ke `auto`.
+- Cek `/health`. Kalau `auth.has_token` false, backend belum berhasil login. Lihat log.
+- Cek log server. Baris `poll failed: ...` berarti polling `POST /v1/bus/offline` gagal; isi pesannya sama dengan kolom `detail` di [Error 502](#error-502).
 - Radius terlalu kecil. Coba `radius_km=1` atau `2`.
 - Titik berada di area tanpa layanan. Upstream mengembalikan daftar kosong untuk area di luar jangkauan TransJakarta.
-- Untuk panggilan pertama via `/buses`, tambahkan `wait=5` supaya backend menunggu data pertama.
+- Bandingkan dengan data mentah `GET /buses/offline` untuk titik dan radius yang sama. Kalau di sana juga kosong, masalahnya ada di upstream, bukan di backend.
 
 ## `GET /buses/{bus_body_no}` selalu 404
 
@@ -76,10 +56,16 @@ Upstream menolak atau gagal menjawab. Pesan aslinya ada di `detail`:
 | Isi `detail` | Kemungkinan sebab |
 |---|---|
 | `HTTP 401 ...` | Token bermasalah. Restart server; kalau memakai `TJ_BEARER_TOKEN`, ganti tokennya |
-| `HTTP 429 ...` | Terlalu banyak request. Naikkan `TJ_REST_POLL_SECONDS` dan `TJ_TOPICS_CACHE_SECONDS` |
+| `HTTP 429 ...` | Terlalu banyak request. Setiap area dengan client WebSocket berarti satu request per detik. Naikkan `TJ_POLL_SECONDS` atau kurangi jumlah area yang dibuka bersamaan |
 | `HTTP 5xx ...` | Server TransJakarta sedang bermasalah. Coba lagi nanti |
 | `ConnectTimeout`, `ConnectError` | Tidak ada internet atau `tijeapi` tidak terjangkau |
 | `response is not JSON` | Upstream mengembalikan halaman HTML, biasanya gangguan atau maintenance |
+
+Hanya polling pertama sebuah area yang menghasilkan 502 (atau pesan `error` di WebSocket). Kalau area sudah pernah berhasil di-polling, kegagalan berikutnya hanya muncul di log sebagai `poll failed: ...` dan client tetap menerima data terakhir. Naiknya `age_seconds` pada semua bus adalah tanda polling sedang gagal.
+
+## Peta patah-patah atau browser berat pada radius besar
+
+Setiap `snapshot` berisi semua bus dalam radius, satu kali per detik. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client. Turunkan radius, naikkan `TJ_POLL_SECONDS`, atau batasi `TJ_MAX_RADIUS_KM` di server. Klien yang hanya butuh beberapa jalur bisa memakai `WS /ws?routes=...` supaya `snapshot` lebih kecil.
 
 ## Port 8000 sudah dipakai
 
@@ -116,4 +102,4 @@ Atau tidak usah mengaktifkan venv dan panggil `.\.venv\Scripts\python` langsung.
 
 ## Test gagal setelah mengubah `.env`
 
-Test membuat `Settings(bearer_token="")` sendiri, tetapi variabel lain dari `.env` (misalnya `TJ_REST_POLL=off` atau email/password) tetap terbaca dan bisa mengubah perilaku yang dites. Jalankan test dengan `.env` dipindahkan sementara, atau dari folder lain dengan `PYTHONPATH` diarahkan ke folder `python`.
+Test membuat `Settings(_env_file=None, ...)` sendiri, jadi isi `.env` tidak terbaca oleh test. Yang tetap terbaca adalah variabel environment `TJ_*` yang di-set langsung di terminal (misalnya `$env:TJ_LOGIN_EMAIL`). Kalau test gagal setelah mengubah konfigurasi, cek `Get-ChildItem env:TJ_*` dan hapus variabel yang tidak perlu dengan `Remove-Item env:TJ_...`.

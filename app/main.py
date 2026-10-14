@@ -18,7 +18,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, settings as default_settings
-from .tracker import Tracker, haversine_km, parse_routes, route_matches
+from .tracker import Tracker, parse_routes, route_matches
 from .upstream import TJClient, UpstreamError
 
 log = logging.getLogger("tj")
@@ -32,23 +32,17 @@ def create_app(
     settings: Settings = default_settings,
     client: TJClient | None = None,
     tracker: Tracker | None = None,
-    start_mqtt: bool = True,
 ) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.client = client or TJClient(settings)
-        app.state.tracker = tracker or Tracker(settings.bus_expiry_seconds, settings.topic_idle_seconds)
-        app.state.tracker.attach_loop(asyncio.get_running_loop())
-        app.state.areas = {}  # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled"}
-        tasks = [asyncio.create_task(_prune_loop(app.state.tracker))]
-        if settings.rest_poll != "off":
-            tasks.append(asyncio.create_task(_rest_poll_loop(app, settings)))
-        if start_mqtt:
-            tasks.append(asyncio.create_task(_connect_mqtt(app, settings)))
+        app.state.tracker = tracker or Tracker(settings.bus_expiry_seconds)
+        # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled", "subscribers", "busy"}
+        app.state.areas = {}
+        tasks = [asyncio.create_task(_prune_loop(app.state.tracker)), asyncio.create_task(_poll_loop(app, settings))]
         yield
         for t in tasks:
             t.cancel()
-        app.state.tracker.stop()
         await app.state.client.aclose()
 
     app = FastAPI(title="TJ Live Tracking API", version="0.1.0", lifespan=lifespan)
@@ -58,20 +52,21 @@ def create_app(
         r = radius_km or settings.default_radius_km
         return min(r, settings.max_radius_km)
 
-    async def track_area(request_app: FastAPI, lat: float, lon: float, radius_km: float) -> list[str]:
-        try:
-            area = await request_app.state.client.get_area(lat, lon, radius_km)
-        except UpstreamError as e:
-            raise HTTPException(502, f"upstream error: {e}") from e
-        request_app.state.tracker.ingest(area.buses, "rest:/v1/bus")
-        request_app.state.tracker.want_topics(area.topics)
+    async def track_area(request_app: FastAPI, lat: float, lon: float, radius_km: float) -> dict[str, Any]:
+        """Register an area and poll it now unless a recent poll already covers it."""
         key = (round(lat, 3), round(lon, 3), radius_km)
-        entry = request_app.state.areas.setdefault(key, {"lat": lat, "lon": lon, "r": radius_km, "polled": 0.0})
+        entry = request_app.state.areas.setdefault(
+            key, {"lat": lat, "lon": lon, "r": radius_km, "polled": 0.0, "subscribers": 0, "busy": False})
         entry["last"] = time.monotonic()
-        # First request for an area while MQTT is down: fetch positions now so the reply is not empty.
-        if _should_poll(request_app, settings) and time.monotonic() - entry["polled"] > settings.rest_poll_seconds:
-            await _poll_area(request_app, entry)
-        return area.topics
+        if time.monotonic() - entry["polled"] >= settings.poll_seconds:
+            first = entry["polled"] == 0.0
+            try:
+                await _poll_area(request_app, entry)
+            except UpstreamError as e:
+                if first:
+                    raise HTTPException(502, f"upstream error: {e}") from e
+                log.warning("poll failed: %s", e)
+        return entry
 
     app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
 
@@ -81,7 +76,13 @@ def create_app(
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
-        return {"status": "ok", "auth": request.app.state.client.token_info(), "mqtt": request.app.state.tracker.stats()}
+        areas = request.app.state.areas.values()
+        return {
+            "status": "ok",
+            "auth": request.app.state.client.token_info(),
+            "tracker": {**request.app.state.tracker.stats(), "areas": len(areas),
+                        "ws_clients": sum(a["subscribers"] for a in areas), "poll_seconds": settings.poll_seconds},
+        }
 
     @app.get("/buses")
     async def buses(
@@ -89,27 +90,19 @@ def create_app(
         lat: float = Query(..., **LAT),
         lon: float = Query(..., **LON),
         radius_km: float | None = Query(None, gt=0),
-        wait: float = Query(0, ge=0, le=10, description="Seconds to wait for first positions if none are cached yet"),
         routes: str | None = Query(None, description="Comma-separated route codes to keep, e.g. 4,4D (exact, case-insensitive)"),
     ) -> dict[str, Any]:
         """Live buses near a point, nearest first. `routes_available` lists every route in the area, before filtering."""
         r = radius_param(radius_km)
         wanted = parse_routes(routes)
-        topics = await track_area(request.app, lat, lon, r)
-        tracker: Tracker = request.app.state.tracker
-        everything = tracker.buses_near(lat, lon, r)
-        deadline = asyncio.get_running_loop().time() + wait
-        while not everything and topics and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.25)
-            everything = tracker.buses_near(lat, lon, r)
+        await track_area(request.app, lat, lon, r)
+        everything = request.app.state.tracker.buses_near(lat, lon, r)
         items = [b for b in everything if route_matches(b, wanted)]
         return {
             "count": len(items),
             "radius_km": r,
             "routes": sorted(wanted) if wanted else None,
             "routes_available": route_summary(everything),
-            "topics": topics,
-            "mqtt_connected": tracker.connected,
             "buses": items,
         }
 
@@ -172,52 +165,42 @@ def create_app(
         radius_km: float | None = Query(None, gt=0),
         routes: str | None = Query(None),
     ) -> None:
-        """Snapshot of buses near a point, then one JSON message per position update. `routes=4,4D` filters by route."""
+        """Every `poll_seconds` (default 1 s): all buses near a point, nearest first. `routes=4,4D` filters by route."""
         r = radius_param(radius_km)
         wanted = parse_routes(routes)
         await websocket.accept()
         tracker: Tracker = websocket.app.state.tracker
         try:
-            await track_area(websocket.app, lat, lon, r)
+            entry = await track_area(websocket.app, lat, lon, r)
         except HTTPException as e:
             await websocket.send_json({"type": "error", "detail": e.detail})
             await websocket.close(code=1011)
             return
-        # One REST poll of a 20 km area yields ~2,300 updates at once; keep room for a few polls.
-        q: asyncio.Queue = asyncio.Queue(maxsize=10000)
-        tracker.add_listener(q)
-        refresh = asyncio.create_task(_refresh_area(websocket.app, lat, lon, r, settings.topics_cache_seconds))
-        try:
-            await websocket.send_json({"type": "snapshot", "buses": tracker.buses_near(lat, lon, r, wanted)})
+        entry["subscribers"] += 1
+
+        async def read() -> None:
+            # Nothing is expected from the client; this only notices when it goes away.
+            while (await websocket.receive())["type"] != "websocket.disconnect":
+                pass
+
+        async def send() -> None:
+            loop = asyncio.get_running_loop()
+            next_at = loop.time()
             while True:
-                bus = await q.get()
-                if bus["latitude"] is None or not route_matches(bus, wanted):
-                    continue
-                d = haversine_km(lat, lon, bus["latitude"], bus["longitude"])
-                if d <= r:
-                    await websocket.send_json({"type": "update", "bus": {**bus, "distance_km": round(d, 3)}})
-        except WebSocketDisconnect:
-            pass
+                entry["last"] = time.monotonic()
+                await websocket.send_json({"type": "snapshot", "buses": tracker.buses_near(lat, lon, r, wanted)})
+                next_at += settings.poll_seconds
+                await asyncio.sleep(max(0.0, next_at - loop.time()))
+
+        tasks = [asyncio.create_task(read()), asyncio.create_task(send())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            refresh.cancel()
-            tracker.remove_listener(q)
+            for t in tasks:
+                t.cancel()
+            entry["subscribers"] -= 1
 
     return app
-
-
-async def _connect_mqtt(app: FastAPI, settings: Settings) -> None:
-    """Resolve the broker URL (retrying on failure) and start the MQTT client."""
-    delay = 5
-    while True:
-        try:
-            url = settings.mqtt_url or await app.state.client.get_mqtt_url()
-            app.state.tracker.start(url, asyncio.get_running_loop())
-            log.info("MQTT broker: %s", url)
-            return
-        except UpstreamError as e:
-            log.warning("cannot get MQTT url (%s); retry in %ss", e, delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 300)
 
 
 def route_summary(buses: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -237,51 +220,52 @@ def _natural_key(code: str) -> list[Any]:
     return [(0, int(p), "") if p.isdigit() else (1, 0, p.upper()) for p in re.findall(r"\d+|\D+", code)]
 
 
-def _should_poll(app: FastAPI, settings: Settings) -> bool:
-    if settings.rest_poll == "always":
-        return True
-    return settings.rest_poll == "auto" and not app.state.tracker.connected
-
-
 async def _poll_area(app: FastAPI, entry: dict[str, Any]) -> None:
-    entry["polled"] = time.monotonic()
+    """POST /v1/bus/offline for one area. Skipped while a poll of the same area is still running."""
+    if entry["busy"]:
+        return
+    entry["busy"] = True
     try:
         buses = await app.state.client.get_offline_buses(entry["lat"], entry["lon"], entry["r"])
-    except UpstreamError as e:
-        log.warning("REST poll failed: %s", e)
-        return
+        entry["polled"] = time.monotonic()
+    finally:
+        entry["busy"] = False
     if isinstance(buses, list):
         app.state.tracker.ingest(buses, "rest:/v1/bus/offline")
 
 
-async def _rest_poll_loop(app: FastAPI, settings: Settings) -> None:
-    """Positions via POST /v1/bus/offline for areas clients asked about recently (fallback when MQTT is down)."""
+async def _poll_quietly(app: FastAPI, entry: dict[str, Any]) -> None:
+    try:
+        await _poll_area(app, entry)
+    except UpstreamError as e:
+        log.warning("poll failed: %s", e)
+
+
+async def _poll_loop(app: FastAPI, settings: Settings) -> None:
+    """Keep areas with WebSocket clients fresh; drop areas nobody asked for recently."""
+    running: set[asyncio.Task] = set()
     while True:
-        await asyncio.sleep(settings.rest_poll_seconds)
-        if not _should_poll(app, settings):
-            continue
+        await asyncio.sleep(settings.poll_seconds)
         now = time.monotonic()
+        due = []
         for key, entry in list(app.state.areas.items()):
-            if now - entry["last"] > settings.topic_idle_seconds:
+            if entry["subscribers"] > 0:
+                if now - entry["polled"] >= settings.poll_seconds * 0.9:
+                    due.append(entry)
+            elif now - entry["last"] > settings.area_idle_seconds:
                 del app.state.areas[key]
-            elif now - entry["polled"] >= settings.rest_poll_seconds - 0.5:
-                await _poll_area(app, entry)
+        # Polls run in the background so one slow area does not delay the others or the next tick.
+        for entry in due:
+            if not entry["busy"]:
+                task = asyncio.create_task(_poll_quietly(app, entry))
+                running.add(task)
+                task.add_done_callback(running.discard)
 
 
 async def _prune_loop(tracker: Tracker) -> None:
     while True:
         await asyncio.sleep(30)
         tracker.prune()
-
-
-async def _refresh_area(app: FastAPI, lat: float, lon: float, r: float, every: float) -> None:
-    """Keep a WebSocket client's area subscribed while it is connected."""
-    while True:
-        await asyncio.sleep(every)
-        with contextlib.suppress(UpstreamError):
-            area = await app.state.client.get_area(lat, lon, r)
-            app.state.tracker.ingest(area.buses, "rest:/v1/bus")
-            app.state.tracker.want_topics(area.topics)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

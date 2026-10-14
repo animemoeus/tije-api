@@ -4,7 +4,7 @@
 
 - Windows, macOS, atau Linux.
 - Python 3.12 atau lebih baru. Proyek ini dikembangkan dengan Python 3.14.6.
-- Koneksi internet ke `tijeapi.transjakarta.co.id` (wajib) dan `mqtt.tj.co.id:8084` (opsional, lihat [10-troubleshooting.md](10-troubleshooting.md)).
+- Koneksi internet ke `tijeapi.transjakarta.co.id` (lihat [10-troubleshooting.md](10-troubleshooting.md) kalau tidak bisa dijangkau).
 
 Cek versi Python:
 
@@ -36,7 +36,6 @@ Isi `requirements.txt` sudah dikunci ke versi yang dites:
 fastapi==0.143.0
 uvicorn[standard]==0.54.0
 httpx==0.28.1
-paho-mqtt==2.1.0
 pydantic==2.14.1
 pydantic-settings==2.15.0
 pytest==9.1.1
@@ -68,13 +67,17 @@ INFO:     Started server process [33424]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-2026-10-13 20:53:48,769 INFO httpx: HTTP Request: POST https://tijeapi.transjakarta.co.id/v1/auth/login/guest "HTTP/1.1 200 OK"
-2026-10-13 20:53:48,770 INFO app.upstream: logged in as guest, token valid until 1791982427
-2026-10-13 20:53:48,820 INFO httpx: HTTP Request: GET https://tijeapi.transjakarta.co.id/v1/settings/api/config/mqtt_url "HTTP/1.1 200 OK"
-2026-10-13 20:53:48,946 INFO tj: MQTT broker: wss://mqtt.tj.co.id:8084/mqtt
 ```
 
-Begitu server hidup, ia langsung login ke TransJakarta dan menanyakan alamat broker MQTT. Kalau broker bisa dihubungi, akan muncul juga baris `MQTT connect wss://mqtt.tj.co.id:8084/mqtt: Success`.
+Saat startup server belum menghubungi TransJakarta. Login baru terjadi pada request pertama yang butuh data upstream, misalnya saat UI peta dibuka atau `/buses` dipanggil:
+
+```
+2026-10-13 20:53:48,769 INFO httpx: HTTP Request: POST https://tijeapi.transjakarta.co.id/v1/auth/login/guest "HTTP/1.1 200 OK"
+2026-10-13 20:53:48,770 INFO app.upstream: logged in as guest, token valid until 1791982427
+2026-10-13 20:53:49,102 INFO httpx: HTTP Request: POST https://tijeapi.transjakarta.co.id/v1/bus/offline "HTTP/1.1 200 OK"
+```
+
+Selama ada client WebSocket yang tersambung, baris `POST .../v1/bus/offline` muncul sekali per detik untuk setiap area yang dipantau.
 
 Hentikan server dengan `Ctrl+C`.
 
@@ -134,4 +137,4 @@ Kalau response `/buses` berisi `"count"` lebih dari 0, semuanya bekerja. Contoh 
 .\.venv\Scripts\python -m pytest -q
 ```
 
-Hasil yang diharapkan: `21 passed`. Test tidak menghubungi server TransJakarta. Lihat [09-testing.md](09-testing.md).
+Hasil yang diharapkan: `20 passed`. Test tidak menghubungi server TransJakarta. Lihat [09-testing.md](09-testing.md).

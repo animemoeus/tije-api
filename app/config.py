@@ -30,21 +30,14 @@ class Settings(BaseSettings):
     login_email: str = ""
     login_password: str = ""
 
-    # Poll POST /v1/bus/offline for tracked areas: "auto" = only while MQTT is down, "always", or "off".
-    rest_poll: str = "auto"
-    rest_poll_seconds: float = 10.0
-
-    # MQTT broker URL. Empty = fetch from /v1/settings/api/config/mqtt_url at startup.
-    mqtt_url: str = ""
-
-    # Cache lifetime of POST /v1/bus topic lookups per area.
-    topics_cache_seconds: float = 60.0
-    # Unsubscribe from a topic when no client has asked for its area for this long.
-    topic_idle_seconds: float = 600.0
+    # Poll POST /v1/bus/offline for areas with a WebSocket client, and push a snapshot to them, this often.
+    poll_seconds: float = 1.0
+    # Forget an area asked for only via GET /buses after this long without requests.
+    area_idle_seconds: float = 60.0
     # Buses with no update for this long are dropped (the app uses 5 minutes).
     bus_expiry_seconds: float = 300.0
     default_radius_km: float = 1.0
-    # Upstream honours large radii (20 km around Bundaran HI: ~1,300 topics, ~2,300 buses, ~1 s).
+    # Upstream honours large radii (20 km around Bundaran HI: ~2,300 buses, ~1 s per poll).
     max_radius_km: float = 20.0
 
 

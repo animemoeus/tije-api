@@ -67,9 +67,9 @@ Sebaiknya hanya buka endpoint baca (`GET`). Endpoint yang mengubah data akun, me
 
 ### Satu proses saja
 
-Posisi bus, topik, area yang dipantau, dan token disimpan di memori proses. Kalau uvicorn dijalankan dengan beberapa worker (`--workers 4`) atau di beberapa container, setiap proses punya data sendiri dan masing-masing membuka koneksi ke upstream. Jalankan satu proses. Satu proses asyncio sudah cukup untuk ratusan client WebSocket.
+Posisi bus, area yang dipantau, dan token disimpan di memori proses. Kalau uvicorn dijalankan dengan beberapa worker (`--workers 4`) atau di beberapa container, setiap proses punya data sendiri dan masing-masing mem-polling upstream untuk areanya sendiri, sehingga client di area yang sama tidak lagi berbagi polling. Jalankan satu proses. Satu proses asyncio sudah cukup untuk banyak client WebSocket; yang lebih cepat habis biasanya bandwidth (lihat batasan di bawah).
 
-Kalau suatu saat memang butuh beberapa proses, pindahkan keadaan bersama ke Redis (posisi bus dan pub/sub update) dan jadikan satu proses sebagai pengumpul data.
+Kalau suatu saat memang butuh beberapa proses, pindahkan keadaan bersama ke Redis (posisi bus dan daftar area) dan jadikan satu proses sebagai satu-satunya yang mem-polling upstream.
 
 ### Menjalankan sebagai layanan
 
@@ -122,7 +122,7 @@ Backend tidak punya autentikasi untuk client. Sebelum dibuka ke publik:
 - Pasang reverse proxy (Caddy, Nginx) dengan HTTPS. Teruskan header `Upgrade` dan `Connection` supaya WebSocket jalan.
 - Tambahkan autentikasi sederhana di proxy (basic auth atau token) atau di FastAPI (dependency yang memeriksa header `X-API-Key`).
 - Jangan isi `TJ_LOGIN_EMAIL`/`TJ_LOGIN_PASSWORD` dengan akun pribadi kalau server publik, karena `/account/trips` akan menampilkan riwayat perjalanan akun itu ke siapa pun.
-- Batasi laju request per IP di proxy supaya beban ke `tijeapi` tidak melonjak karena client lain.
+- Batasi laju request dan jumlah koneksi WebSocket per IP di proxy. Setiap area baru yang dibuka client berarti satu request per detik ke `tijeapi`.
 - Sempitkan `allow_origins` di `CORSMiddleware` ke domain yang benar-benar memakai API.
 
 Contoh Caddy:
@@ -140,7 +140,8 @@ tj.contoh.id {
 
 | Batasan | Dampak | Kemungkinan solusi |
 |---|---|---|
-| Broker MQTT tidak terjangkau dari sebagian jaringan | Update tiap 10 detik, bukan realtime | Jalankan di jaringan Indonesia; turunkan `TJ_REST_POLL_SECONDS` dengan hati-hati |
+| Data hanya dari polling `POST /v1/bus/offline` | Posisi paling cepat diperbarui sekali per `TJ_POLL_SECONDS`, dan setiap area aktif berarti satu request per detik ke upstream | Naikkan `TJ_POLL_SECONDS` kalau beban upstream jadi masalah |
+| `snapshot` selalu berisi semua bus dalam radius | Radius 20 km ≈ 2.300 bus ≈ 1–2 MB per detik per client | Turunkan `TJ_MAX_RADIUS_KM`, pakai filter `routes`, atau kirim hanya bus yang berubah (diff) |
 | `estimated_time_next_stops` dari upstream sering 0 | ETA tidak bisa ditampilkan | Hitung sendiri dari `estimated_distance_next_stops` dan kecepatan rata-rata |
 | `speed` dari REST selalu 0 | Tidak bisa tahu bus berhenti atau jalan | Hitung dari perubahan posisi antar polling |
 | Upstream membatasi halte 20 per request | Daftar halte terpotong di area padat | Pakai radius lebih kecil, atau panggil beberapa titik |

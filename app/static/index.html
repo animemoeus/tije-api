@@ -179,7 +179,10 @@
     if (b.latitude == null || b.longitude == null) return;
     let entry = state.buses.get(b.bus_body_no);
     if (entry) {
+      const old = entry.data;
       entry.data = b; entry.seen = Date.now();
+      // Snapshots repeat every bus each second; only touch markers that changed.
+      if (old.latitude === b.latitude && old.longitude === b.longitude && old.bearing === b.bearing && old.timestamp === b.timestamp) return;
       entry.marker.setLatLng([b.latitude, b.longitude]).setIcon(busIcon(b)).setPopupContent(popupHtml(b));
     } else {
       const marker = L.marker([b.latitude, b.longitude], { icon: busIcon(b) }).bindPopup(popupHtml(b));
@@ -309,8 +312,12 @@
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === "error") { serverError = msg.detail; setStatus("Error: " + msg.detail, "err"); return; }
-      if (msg.type === "snapshot") { state.retry = 0; msg.buses.forEach(upsertBus); }
-      else if (msg.type === "update") upsertBus(msg.bus);
+      if (msg.type !== "snapshot") return;
+      // Each snapshot is the full set of buses in the radius: add/move those in it, drop the rest.
+      state.retry = 0;
+      const keep = new Set(msg.buses.map((b) => b.bus_body_no));
+      for (const [no, x] of state.buses) if (!keep.has(no)) { busLayer.removeLayer(x.marker); state.buses.delete(no); }
+      msg.buses.forEach(upsertBus);
       scheduleList();
     };
     ws.onclose = () => {
@@ -395,7 +402,7 @@
     try {
       const h = await (await fetch(new URL("/health", API))).json();
       const who = h.auth.logged_in_as === "user" ? `akun ${h.auth.email}` : h.auth.logged_in_as || "belum login";
-      const src = h.mqtt.connected ? "MQTT realtime" : "polling REST (MQTT tidak terjangkau)";
+      const src = `polling REST tiap ${h.tracker.poll_seconds} dtk`;
       $("source").textContent = `Sumber: ${src} · ${who}${h.auth.last_error ? " · ⚠ " + h.auth.last_error.slice(0, 80) : ""}`;
     } catch {
       $("source").textContent = "API tidak bisa dihubungi";

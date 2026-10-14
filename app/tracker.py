@@ -1,21 +1,15 @@
-"""Live bus state fed by the TransJakarta MQTT broker.
+"""Cache of live bus positions, filled by polling POST /v1/bus/offline.
 
-The app's map WebView does `mqtt.connect(mqtt_url, 'id_' + random)` with no credentials,
-subscribes to the topics returned by POST /v1/bus, and treats every message as one bus JSON:
+Each bus is a JSON object as the app receives it:
   bus_body_no, latitude, longitude, snap_latitude, snap_longitude, bearing, timestamp,
   route_code, route_color, route_text_color, next_stops, estimated_time_next_stops, type
 """
 
-import asyncio
-import json
 import logging
 import math
-import random
-import ssl
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -63,144 +57,31 @@ def bus_type(raw: Any) -> str:
 
 
 class Tracker:
-    def __init__(self, bus_expiry_seconds: float, topic_idle_seconds: float):
+    def __init__(self, bus_expiry_seconds: float):
         self.bus_expiry_seconds = bus_expiry_seconds
-        self.topic_idle_seconds = topic_idle_seconds
         self._lock = threading.Lock()
-        self._buses: dict[str, dict[str, Any]] = {}  # bus_body_no -> {"data", "topic", "received_at"}
-        self._topics: dict[str, float] = {}  # topic -> last time a client asked for it
-        self._subscribed: set[str] = set()
-        self._listeners: set[asyncio.Queue] = set()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._client = None
-        self.connected = False
-        self.broker_url = ""
-
-    # ---- MQTT connection -------------------------------------------------
-
-    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Event loop that WebSocket listeners run on; MQTT callbacks hand updates to it."""
-        self._loop = loop
-
-    def start(self, broker_url: str, loop: asyncio.AbstractEventLoop) -> None:
-        import paho.mqtt.client as mqtt
-
-        self._loop = loop
-        self.broker_url = broker_url
-        u = urlparse(broker_url)
-        scheme = (u.scheme or "wss").lower()
-        websockets = scheme in ("ws", "wss")
-        secure = scheme in ("wss", "mqtts", "ssl")
-        port = u.port or {"ws": 80, "wss": 443, "mqtt": 1883, "tcp": 1883, "mqtts": 8883, "ssl": 8883}.get(scheme, 443)
-
-        client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"id_{random.randint(0, 99999)}",
-            transport="websockets" if websockets else "tcp",
-        )
-        if websockets:
-            client.ws_set_options(path=(u.path or "/mqtt") + (f"?{u.query}" if u.query else ""))
-        if secure:
-            client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-        client.on_connect = self._on_connect
-        client.on_disconnect = self._on_disconnect
-        client.on_message = lambda _c, _u, msg: self.handle_message(msg.topic, msg.payload)
-        client.reconnect_delay_set(min_delay=1, max_delay=30)
-        client.connect_async(u.hostname, port, keepalive=60)
-        client.loop_start()
-        self._client = client
-
-    def stop(self) -> None:
-        if self._client:
-            self._client.loop_stop()
-            self._client.disconnect()
-            self._client = None
-        self.connected = False
-
-    def _on_connect(self, client, _userdata, _flags, reason_code, _props) -> None:
-        self.connected = not reason_code.is_failure
-        log.info("MQTT connect %s: %s", self.broker_url, reason_code)
-        if self.connected:
-            with self._lock:
-                topics = list(self._topics)
-                self._subscribed.clear()
-            self._subscribe(topics)
-
-    def _on_disconnect(self, _client, _userdata, _flags, reason_code, _props) -> None:
-        self.connected = False
-        log.warning("MQTT disconnected: %s", reason_code)
-
-    def _subscribe(self, topics: list[str]) -> None:
-        if not self._client or not self.connected:
-            return
-        with self._lock:
-            new = [t for t in topics if t not in self._subscribed]
-            self._subscribed.update(new)
-        for t in new:
-            self._client.subscribe(t, qos=0)
-
-    # ---- Topics ----------------------------------------------------------
-
-    def want_topics(self, topics: list[str]) -> None:
-        """Mark topics as needed now and subscribe to any new ones."""
-        now = time.monotonic()
-        with self._lock:
-            for t in topics:
-                self._topics[t] = now
-        self._subscribe(topics)
+        self._buses: dict[str, dict[str, Any]] = {}  # bus_body_no -> {"data", "source", "received_at"}
 
     def prune(self) -> None:
-        """Drop expired buses and unsubscribe from topics nobody asked for recently."""
+        """Drop buses with no update for bus_expiry_seconds."""
         now = time.monotonic()
         with self._lock:
             for no in [n for n, b in self._buses.items() if now - b["received_at"] > self.bus_expiry_seconds]:
                 del self._buses[no]
-            idle = [t for t, ts in self._topics.items() if now - ts > self.topic_idle_seconds]
-            for t in idle:
-                del self._topics[t]
-                self._subscribed.discard(t)
-        if idle and self._client and self.connected:
-            for t in idle:
-                self._client.unsubscribe(t)
 
-    # ---- Messages --------------------------------------------------------
-
-    def handle_message(self, topic: str, payload: bytes) -> None:
-        try:
-            data = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            log.debug("non-JSON message on %s", topic)
-            return
-        self.ingest(data if isinstance(data, list) else [data], topic)
-
-    def ingest(self, items: list[Any], topic: str) -> None:
-        """Store bus dicts from MQTT or from the REST POST /v1/bus response."""
-        for bus in items:
-            if not isinstance(bus, dict) or not bus.get("bus_body_no"):
-                continue
-            no = str(bus["bus_body_no"])
-            with self._lock:
+    def ingest(self, items: list[Any], source: str) -> None:
+        """Store bus dicts from an upstream response."""
+        now = time.monotonic()
+        with self._lock:
+            for bus in items:
+                if not isinstance(bus, dict) or not bus.get("bus_body_no"):
+                    continue
+                no = str(bus["bus_body_no"])
                 prev = self._buses.get(no)
                 # Same rule as the app: ignore out-of-order updates.
                 if prev and _num(prev["data"].get("timestamp")) > _num(bus.get("timestamp")):
                     continue
-                # REST polls repeat every bus each time; only a real change is worth sending to clients.
-                changed = prev is None or prev["data"] != bus
-                self._buses[no] = {"data": bus, "topic": topic, "received_at": time.monotonic()}
-            if changed:
-                self._broadcast(self.to_public(no))
-
-    def _broadcast(self, item: dict[str, Any] | None) -> None:
-        if not item or not self._loop:
-            return
-        for q in list(self._listeners):
-            self._loop.call_soon_threadsafe(_put_nowait_drop_oldest, q, item)
-
-    def add_listener(self, q: asyncio.Queue) -> None:
-        self._listeners.add(q)
-
-    def remove_listener(self, q: asyncio.Queue) -> None:
-        self._listeners.discard(q)
+                self._buses[no] = {"data": bus, "source": source, "received_at": now}
 
     # ---- Queries ---------------------------------------------------------
 
@@ -209,7 +90,7 @@ class Tracker:
             entry = self._buses.get(bus_body_no)
             if not entry:
                 return None
-            bus, topic, received_at = entry["data"], entry["topic"], entry["received_at"]
+            bus, source, received_at = entry["data"], entry["source"], entry["received_at"]
         pos = bus_position(bus)
         return {
             "bus_body_no": bus_body_no,
@@ -231,7 +112,7 @@ class Tracker:
             "prev_stop_name": stop_name(bus.get("prev_stops")),
             "estimated_time_next_stops": bus.get("estimated_time_next_stops"),
             "estimated_distance_next_stops": bus.get("estimated_distance_next_stops"),
-            "topic": topic,
+            "source": source,
             "age_seconds": round(time.monotonic() - received_at, 1),
         }
 
@@ -250,14 +131,7 @@ class Tracker:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "connected": self.connected,
-                "broker_url": self.broker_url,
-                "buses": len(self._buses),
-                "topics": len(self._topics),
-                "subscribed": len(self._subscribed),
-                "listeners": len(self._listeners),
-            }
+            return {"buses": len(self._buses)}
 
 
 def _num(v: Any) -> float:
@@ -266,11 +140,3 @@ def _num(v: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-
-def _put_nowait_drop_oldest(q: asyncio.Queue, item: Any) -> None:
-    if q.full():
-        try:
-            q.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-    q.put_nowait(item)

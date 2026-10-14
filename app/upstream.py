@@ -3,9 +3,7 @@
 Endpoints and payloads come from the app's Hermes bundle (v3.0.4):
   guestLogin           POST /v1/auth/login/guest {} -> {token, refresh_token, token_valid_until, ...}
   token refresh        POST /v1/auth/token/refresh {refresh_token}
-  getConfigBe          GET  /v1/settings/api/config/mqtt_url -> data.properties.url
-  getBusNearest        POST /v1/bus {latitude, longitude, radius, event:"change_loc"} -> data.{topics, buses, stops}
-  getBusNearestOffline POST /v1/bus/offline (same body)
+  getBusNearestOffline POST /v1/bus/offline {latitude, longitude, radius, event:"change_loc"} -> data: [bus, ...]
   getSearchBusStopNew  GET  /v2/bus-stop?latitude&longitude&radius
 
   login                POST /v1/auth/login {email, password} -> same token fields as guest login
@@ -17,7 +15,6 @@ Without TJ_BEARER_TOKEN the client logs in with TJ_LOGIN_EMAIL/TJ_LOGIN_PASSWORD
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -36,12 +33,6 @@ class UpstreamError(Exception):
         self.status = status
 
 
-@dataclass
-class AreaInfo:
-    topics: list[str]
-    buses: list[dict[str, Any]] = field(default_factory=list)
-
-
 class TJClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
@@ -51,8 +42,6 @@ class TJClient:
             headers=self._headers(),
             transport=transport,
         )
-        self._topics_cache: dict[tuple[float, float, float], tuple[float, AreaInfo]] = {}
-        self._lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
         self._token = settings.bearer_token
         self._token_valid_until = float("inf") if settings.bearer_token else 0.0
@@ -178,37 +167,9 @@ class TJClient:
             token = await self._ensure_token(force=True)
             return await self._send(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
 
-    async def get_mqtt_url(self) -> str:
-        body = await self._request("GET", "/v1/settings/api/config/mqtt_url")
-        url = ((body or {}).get("data") or {}).get("properties", {}).get("url")
-        if not url:
-            raise UpstreamError("mqtt_url config has no data.properties.url")
-        return url
-
     @staticmethod
     def _area_payload(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
         return {"latitude": lat, "longitude": lon, "radius": radius_km, "event": "change_loc"}
-
-    async def get_area(self, lat: float, lon: float, radius_km: float) -> AreaInfo:
-        """MQTT topics (and any current buses) near a point. Cached per ~100 m grid cell."""
-        key = (round(lat, 3), round(lon, 3), radius_km)
-        now = time.monotonic()
-        async with self._lock:
-            hit = self._topics_cache.get(key)
-            if hit and now - hit[0] < self.settings.topics_cache_seconds:
-                return hit[1]
-        body = await self._request("POST", "/v1/bus", json=self._area_payload(lat, lon, radius_km))
-        data = (body or {}).get("data") or {}
-        info = AreaInfo(
-            topics=[t for t in data.get("topics") or [] if isinstance(t, str) and t],
-            buses=[b for b in data.get("buses") or [] if isinstance(b, dict)],
-        )
-        async with self._lock:
-            self._topics_cache[key] = (now, info)
-        return info
-
-    async def get_topics(self, lat: float, lon: float, radius_km: float) -> list[str]:
-        return (await self.get_area(lat, lon, radius_km)).topics
 
     async def get_offline_buses(self, lat: float, lon: float, radius_km: float) -> Any:
         body = await self._request("POST", "/v1/bus/offline", json=self._area_payload(lat, lon, radius_km))

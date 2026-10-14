@@ -6,7 +6,7 @@ Semua pengaturan dibaca oleh `app/config.py` dengan pydantic-settings. Sumbernya
 2. File `.env` di folder `python` (folder tempat server dijalankan).
 3. Nilai bawaan di kode.
 
-Nama variabel tidak peka huruf besar-kecil. `TJ_REST_POLL` dan `tj_rest_poll` dianggap sama. Variabel yang tidak dikenal diabaikan.
+Nama variabel tidak peka huruf besar-kecil. `TJ_POLL_SECONDS` dan `tj_poll_seconds` dianggap sama. Variabel yang tidak dikenal diabaikan.
 
 Contoh `.env` lengkap ada di `.env.example`. Salin dan ubah seperlunya:
 
@@ -38,17 +38,20 @@ Penjelasan lengkap ada di [06-autentikasi-upstream.md](06-autentikasi-upstream.m
 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
-| `TJ_MQTT_URL` | kosong | Alamat broker MQTT. Kosong berarti backend menanyakannya ke upstream (`/v1/settings/api/config/mqtt_url`). Skema yang didukung: `ws://`, `wss://`, `mqtt://`, `tcp://`, `mqtts://`, `ssl://` |
-| `TJ_REST_POLL` | `auto` | `auto`: polling `POST /v1/bus/offline` hanya saat MQTT tidak terhubung. `always`: selalu polling, walau MQTT terhubung. `off`: tidak pernah polling |
-| `TJ_REST_POLL_SECONDS` | `10` | Jarak antar polling per area, dalam detik |
+Posisi bus hanya diambil dari `POST /v1/bus/offline`.
+
+| Variabel | Bawaan | Keterangan |
+|---|---|---|
+| `TJ_POLL_SECONDS` | `1` | Jarak antar polling upstream untuk area yang punya client WebSocket, sekaligus jarak antar `snapshot` yang dikirim ke setiap client WebSocket. `GET /buses` juga memakai data yang ada kalau umurnya belum melewati angka ini |
 
 ## Cache dan masa simpan
 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
-| `TJ_TOPICS_CACHE_SECONDS` | `60` | Lama hasil `POST /v1/bus` (daftar topik) disimpan per area. Area dibulatkan ke kisi sekitar 100 meter |
-| `TJ_TOPIC_IDLE_SECONDS` | `600` | Area atau topik yang tidak diminta client selama ini akan dilepas: berhenti di-polling dan di-unsubscribe |
+| `TJ_AREA_IDLE_SECONDS` | `60` | Area yang hanya diminta lewat `GET /buses` (tanpa client WebSocket) dilupakan setelah tidak diminta selama ini. Area dengan client WebSocket tidak pernah dilupakan selama client masih tersambung |
 | `TJ_BUS_EXPIRY_SECONDS` | `300` | Bus yang tidak mendapat update selama ini dihapus dari memori. App asli juga memakai 5 menit |
+
+Area dikenali dari lintang dan bujur yang dibulatkan ke 3 desimal (kisi sekitar 100 meter) ditambah radius. Dua client yang memilih titik hampir sama dengan radius sama memakai area dan polling yang sama.
 
 ## Area dan radius
 
@@ -59,14 +62,16 @@ Penjelasan lengkap ada di [06-autentikasi-upstream.md](06-autentikasi-upstream.m
 
 Beban untuk upstream dan browser naik cepat seiring radius. Hasil pengukuran di sekitar Bundaran HI (13 Oktober 2026):
 
-| Radius | Topik MQTT | Bus dari `/v1/bus/offline` | Waktu respons upstream |
-|---|---|---|---|
-| 1 km | 6 | 16 | 0,3 dtk |
-| 5 km | 100 | 395 | 0,6 dtk |
-| 10 km | 361 | 1.329 | 0,9 dtk |
-| 20 km | 1.332 | 2.347 | 1,1 dtk |
+| Radius | Bus dari `/v1/bus/offline` | Waktu respons upstream |
+|---|---|---|
+| 1 km | 16 | 0,3 dtk |
+| 5 km | 395 | 0,6 dtk |
+| 10 km | 1.329 | 0,9 dtk |
+| 20 km | 2.347 | 1,1 dtk |
 
-Pada radius 20 km, satu polling bisa mengubah posisi ±1.300 bus sekaligus. Backend hanya mengirim bus yang datanya berubah, dan UI membatasi daftar ke 200 bus terdekat, jadi tetap lancar. Kalau server dipakai banyak client sekaligus, pertimbangkan menurunkan `TJ_MAX_RADIUS_KM`.
+Setiap area yang punya client WebSocket berarti satu request per detik (dengan `TJ_POLL_SECONDS=1`) ke `tijeapi`. Client di area yang sama berbagi polling itu, tapi setiap area berbeda menambah satu request per detik. Pada radius 20 km waktu respons upstream sudah sekitar 1 detik, jadi polling area itu praktis berjalan terus-menerus (polling berikutnya dilewati selama yang sebelumnya belum selesai).
+
+Setiap `snapshot` WebSocket berisi semua bus dalam radius. Pada radius 20 km itu sekitar 2.300 bus, atau 1 sampai 2 MB per detik untuk setiap client. UI membatasi daftar ke 200 bus terdekat dan hanya memperbarui marker yang berubah, jadi peta tetap lancar, tapi bandwidth tetap besar. Kalau server dipakai banyak client sekaligus, pertimbangkan menurunkan `TJ_MAX_RADIUS_KM` atau menaikkan `TJ_POLL_SECONDS`.
 
 Batas koordinat tidak bisa diubah lewat konfigurasi. Nilainya ada di `app/main.py`: lintang -7.5 sampai -5.5 dan bujur 106.0 sampai 107.5, kira-kira Jabodetabek dan sekitarnya.
 
@@ -110,25 +115,13 @@ TJ_LOGIN_PASSWORD=rahasia
 TJ_DEVICE_ID=4f1c2a9be07d3e55
 ```
 
-Jaringan yang bisa menjangkau broker, tapi ingin data REST tetap masuk:
+Mengurangi beban ke upstream dan bandwidth ke client (posisi diperbarui tiap 5 detik):
 
 ```
-TJ_REST_POLL=always
-TJ_REST_POLL_SECONDS=15
-```
-
-Mematikan polling sama sekali (hanya MQTT):
-
-```
-TJ_REST_POLL=off
-```
-
-Memakai broker lain secara langsung, tanpa bertanya ke upstream:
-
-```
-TJ_MQTT_URL=wss://mqtt.tj.co.id:8084/mqtt
+TJ_POLL_SECONDS=5
+TJ_MAX_RADIUS_KM=5
 ```
 
 ## Mengecek konfigurasi yang aktif
 
-`GET /health` dan `GET /account` menunjukkan mode login, email yang dipakai, alamat broker, dan status koneksi. Password dan token tidak pernah ditampilkan.
+`GET /health` dan `GET /account` menunjukkan mode login, email yang dipakai, jumlah area dan client WebSocket, serta interval polling (`tracker.poll_seconds`). Password dan token tidak pernah ditampilkan.
