@@ -60,7 +60,7 @@ Area dikenali dari lintang dan bujur yang dibulatkan ke 3 desimal (kisi sekitar 
 | Variabel | Bawaan | Keterangan |
 |---|---|---|
 | `TJ_DEFAULT_RADIUS_KM` | `1.0` | Radius kalau client tidak mengirim `radius_km` |
-| `TJ_MAX_RADIUS_KM` | `20.0` | Radius terbesar yang diizinkan. Nilai yang lebih besar dipotong ke angka ini |
+| `TJ_MAX_RADIUS_KM` | `50.0` | Radius terbesar yang diizinkan. Nilai yang lebih besar dipotong ke angka ini |
 
 Beban untuk upstream dan browser naik cepat seiring radius. Hasil pengukuran di sekitar Bundaran HI (13 Oktober 2026):
 

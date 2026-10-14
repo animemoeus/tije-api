@@ -329,22 +329,22 @@ def test_validation_and_upstream_errors(client, fake):
 def test_radius_capped_at_max(client, fake):
     assert (
         client.get(
-            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 20}
+            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 50}
         ).json()["radius_km"]
-        == 20
+        == 50
     )
     assert (
         client.get(
-            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 50}
+            "/buses", params={"lat": MONAS[0], "lon": MONAS[1], "radius_km": 80}
         ).json()["radius_km"]
-        == 20
+        == 50
     )
     sent = {
         json.loads(c.content)["radius"]
         for c in fake.calls
         if c.url.path == "/v1/bus/offline"
     }
-    assert sent == {20.0}
+    assert sent == {50.0}
 
 
 def test_route_filter(client, fake):

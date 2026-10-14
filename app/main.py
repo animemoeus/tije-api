@@ -79,7 +79,7 @@ def create_app(
 
     app = FastAPI(title="TJ Live Tracking API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
-        CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"]
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
     )
 
     def radius_param(radius_km: float | None) -> float:

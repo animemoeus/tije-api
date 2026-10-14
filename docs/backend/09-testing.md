@@ -37,7 +37,7 @@ Semua test ada di `tests/test_api.py`.
 | `test_snapped_position_and_out_of_order_updates` | Posisi `snap_*` diutamakan; update dengan timestamp lebih lama diabaikan |
 | `test_bus_not_found_and_bad_payload` | Item yang bukan objek bus diabaikan oleh `ingest`; bus tak dikenal → 404 |
 | `test_validation_and_upstream_errors` | Koordinat London → 422; upstream 500 → 502 di `/buses/offline` dan `/buses`; WebSocket menerima pesan `error` |
-| `test_radius_capped_at_max` | Radius 50 dipotong ke 20, dan upstream hanya menerima radius 20 |
+| `test_radius_capped_at_max` | Radius 80 dipotong ke 50, dan upstream hanya menerima radius 50 |
 | `test_route_filter` | `routes= 4, 4d ` hanya mengembalikan jalur 4 dan 4D; `routes_available` urut alami dengan jumlah benar |
 | `test_websocket_route_filter` | WebSocket dengan `routes=4D,4` hanya mengirim jalur itu, tidak peka huruf besar-kecil, termasuk bus yang baru muncul di polling berikutnya |
 | `test_websocket_sends_snapshot_every_interval` | WebSocket mengirim `snapshot` berulang sesuai `poll_seconds` (tidak beruntun tanpa jeda), hanya bus dalam radius dengan `distance_km`; bus yang bergerak, baru muncul, atau keluar radius terlihat di `snapshot` berikutnya; `ws_clients` kembali 0 setelah client putus |

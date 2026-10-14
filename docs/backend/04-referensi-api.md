@@ -10,9 +10,9 @@ Dokumentasi interaktif yang dibuat otomatis oleh FastAPI ada di `/docs` (Swagger
 |---|---|
 | Format | Semua response berupa JSON (`Content-Type: application/json`), kecuali `/ui` |
 | Autentikasi client | Tidak ada. Siapa pun yang bisa menjangkau server bisa memanggil API. Lihat [11-pengembangan-lanjut.md](11-pengembangan-lanjut.md) kalau server dibuka ke internet |
-| CORS | Semua origin diizinkan untuk method `GET` |
+| CORS | Semua origin, method, dan header diizinkan |
 | Koordinat | `lat` harus di antara -7.5 dan -5.5, `lon` di antara 106.0 dan 107.5 |
-| Radius | `radius_km` harus lebih dari 0. Kosong berarti 1 km. Nilai di atas 20 (`TJ_MAX_RADIUS_KM`) dipotong menjadi 20 |
+| Radius | `radius_km` harus lebih dari 0. Kosong berarti 1 km. Nilai di atas 50 (`TJ_MAX_RADIUS_KM`) dipotong menjadi 50 |
 | Filter jalur | `routes` berisi kode jalur dipisah koma, misalnya `4,4D,JAK.10`. Cocok persis, tidak peka huruf besar-kecil (`4d` = `4D`). `4` tidak ikut mencocokkan `4D` |
 | Waktu | `age_seconds` dalam detik. `valid_until` berupa unix timestamp (detik) |
 
