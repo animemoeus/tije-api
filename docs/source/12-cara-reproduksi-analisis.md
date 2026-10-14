@@ -46,17 +46,33 @@ Skrip `manifest.py` (simpan di luar folder kerja):
 
 ```python
 import sys
-from loguru import logger; logger.remove()
+from loguru import logger
+
+logger.remove()
 from androguard.core.apk import APK
 
 a = APK(sys.argv[1])
-print(a.get_package(), a.get_androidversion_name(), a.get_androidversion_code(),
-      "min", a.get_min_sdk_version(), "target", a.get_target_sdk_version())
+print(
+    a.get_package(),
+    a.get_androidversion_name(),
+    a.get_androidversion_code(),
+    "min",
+    a.get_min_sdk_version(),
+    "target",
+    a.get_target_sdk_version(),
+)
 print("main:", a.get_main_activity())
-open(sys.argv[2], "w", encoding="utf-8").write(a.get_android_manifest_axml().get_xml().decode())
-for kind, items in (("activity", a.get_activities()), ("service", a.get_services()),
-                    ("receiver", a.get_receivers()), ("provider", a.get_providers())):
-    print(f"[{kind}] {len(items)}"); [print("  ", i) for i in items]
+open(sys.argv[2], "w", encoding="utf-8").write(
+    a.get_android_manifest_axml().get_xml().decode()
+)
+for kind, items in (
+    ("activity", a.get_activities()),
+    ("service", a.get_services()),
+    ("receiver", a.get_receivers()),
+    ("provider", a.get_providers()),
+):
+    print(f"[{kind}] {len(items)}")
+    [print("  ", i) for i in items]
 ```
 
 ```powershell
@@ -78,15 +94,17 @@ Tabel string (satu string per baris) lebih enak untuk pencarian awal:
 ```python
 # dumpstr.py
 import sys
+
 sys.path.insert(0, sys.argv[1])
 from hermes_dec.parsers.hbc_file_parser import HBCReader
+
 r = HBCReader()
 with open(sys.argv[2], "rb") as f:
     r.read_whole_file(f)
 with open(sys.argv[3], "w", encoding="utf-8", errors="backslashreplace") as o:
     for i, s in enumerate(r.strings):
         o.write(f"{i}\t{s!r}\n" if "\n" in s else f"{i}\t{s}\n")
-print(len(r.strings))   # 73034
+print(len(r.strings))  # 73034
 ```
 
 ### Pencarian yang berguna
@@ -106,6 +124,7 @@ Membuat katalog endpoint otomatis (dipakai untuk [07-katalog-api-upstream.md](07
 ```python
 # catalog.py
 import re, sys, collections
+
 lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n")
 name_re = re.compile(r"Original name: ([A-Za-z0-9_$]+)")
 path_re = re.compile(r"'(/v\d+/[A-Za-z0-9_\-/{}.:]*)'")
@@ -115,7 +134,14 @@ out = collections.OrderedDict()
 for i, line in enumerate(lines):
     m = svc_re.search(line)
     if m:
-        nm = next((name_re.search(lines[j]).group(1) for j in range(i, max(0, i - 40), -1) if name_re.search(lines[j])), "?")
+        nm = next(
+            (
+                name_re.search(lines[j]).group(1)
+                for j in range(i, max(0, i - 40), -1)
+                if name_re.search(lines[j])
+            ),
+            "?",
+        )
         out.setdefault((m.group(2), m.group(1).upper()), set()).add(nm)
         continue
     m = path_re.search(line)
@@ -126,8 +152,15 @@ for i, line in enumerate(lines):
         mm = meth_re.search(lines[j])
         if mm:
             meth = mm.group(1).upper()
-    nm = next((name_re.search(lines[j]).group(1) for j in range(i, min(len(lines), i + 40))
-               if name_re.search(lines[j]) and not name_re.search(lines[j]).group(1).startswith("?")), "?")
+    nm = next(
+        (
+            name_re.search(lines[j]).group(1)
+            for j in range(i, min(len(lines), i + 40))
+            if name_re.search(lines[j])
+            and not name_re.search(lines[j]).group(1).startswith("?")
+        ),
+        "?",
+    )
     out.setdefault((m.group(1), meth or "?"), set()).add(nm)
 for (p, meth), names in sorted(out.items()):
     print(f"{meth}\t{p}\t{','.join(sorted(names))}")

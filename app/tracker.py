@@ -60,13 +60,19 @@ class Tracker:
     def __init__(self, bus_expiry_seconds: float):
         self.bus_expiry_seconds = bus_expiry_seconds
         self._lock = threading.Lock()
-        self._buses: dict[str, dict[str, Any]] = {}  # bus_body_no -> {"data", "source", "received_at"}
+        self._buses: dict[
+            str, dict[str, Any]
+        ] = {}  # bus_body_no -> {"data", "source", "received_at"}
 
     def prune(self) -> None:
         """Drop buses with no update for bus_expiry_seconds."""
         now = time.monotonic()
         with self._lock:
-            for no in [n for n, b in self._buses.items() if now - b["received_at"] > self.bus_expiry_seconds]:
+            for no in [
+                n
+                for n, b in self._buses.items()
+                if now - b["received_at"] > self.bus_expiry_seconds
+            ]:
                 del self._buses[no]
 
     def ingest(self, items: list[Any], source: str) -> None:
@@ -79,7 +85,9 @@ class Tracker:
                 no = str(bus["bus_body_no"])
                 prev = self._buses.get(no)
                 # Same rule as the app: ignore out-of-order updates.
-                if prev and _num(prev["data"].get("timestamp")) > _num(bus.get("timestamp")):
+                if prev and _num(prev["data"].get("timestamp")) > _num(
+                    bus.get("timestamp")
+                ):
                     continue
                 self._buses[no] = {"data": bus, "source": source, "received_at": now}
 
@@ -90,7 +98,11 @@ class Tracker:
             entry = self._buses.get(bus_body_no)
             if not entry:
                 return None
-            bus, source, received_at = entry["data"], entry["source"], entry["received_at"]
+            bus, source, received_at = (
+                entry["data"],
+                entry["source"],
+                entry["received_at"],
+            )
         pos = bus_position(bus)
         return {
             "bus_body_no": bus_body_no,
@@ -117,7 +129,9 @@ class Tracker:
             "age_seconds": round(time.monotonic() - received_at, 1),
         }
 
-    def buses_near(self, lat: float, lon: float, radius_km: float, routes: set[str] | None = None) -> list[dict[str, Any]]:
+    def buses_near(
+        self, lat: float, lon: float, radius_km: float, routes: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         with self._lock:
             nos = list(self._buses)
         out = []
@@ -140,4 +154,3 @@ def _num(v: Any) -> float:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
-

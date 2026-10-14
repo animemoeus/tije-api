@@ -747,6 +747,7 @@ Python (paket `websockets`):
 ```python
 import asyncio, json, websockets
 
+
 async def main():
     url = "ws://localhost:8000/ws?lat=-6.1950&lon=106.8231&radius_km=0.5"
     async with websockets.connect(url) as ws:
@@ -756,7 +757,12 @@ async def main():
                 print("error:", msg["detail"])
             elif msg["type"] == "snapshot":
                 nearest = msg["buses"][:3]
-                print(len(msg["buses"]), "bus;", ", ".join(f'{b["route_code"]} {b["bus_body_no"]}' for b in nearest))
+                print(
+                    len(msg["buses"]),
+                    "bus;",
+                    ", ".join(f"{b['route_code']} {b['bus_body_no']}" for b in nearest),
+                )
+
 
 asyncio.run(main())
 ```
@@ -778,7 +784,9 @@ with httpx.Client(base_url="http://localhost:8000") as api:
     r = api.get("/buses", params={"lat": -6.1950, "lon": 106.8231, "radius_km": 0.5})
     r.raise_for_status()
     for bus in r.json()["buses"]:
-        print(f'{bus["route_code"]:>6} {bus["bus_body_no"]:<12} {bus["distance_km"] * 1000:5.0f} m  → {bus["next_stop_name"]}')
+        print(
+            f"{bus['route_code']:>6} {bus['bus_body_no']:<12} {bus['distance_km'] * 1000:5.0f} m  → {bus['next_stop_name']}"
+        )
 ```
 
 Contoh keluaran:

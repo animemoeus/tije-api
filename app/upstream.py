@@ -37,7 +37,9 @@ class UpstreamError(Exception):
 
 
 class TJClient:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
+    ):
         self.settings = settings
         self._http = httpx.AsyncClient(
             base_url=settings.base_url,
@@ -50,7 +52,9 @@ class TJClient:
         self._token_valid_until = float("inf") if settings.bearer_token else 0.0
         self._refresh_token = ""
         self._refresh_valid_until = 0.0
-        self._logged_in_as = ""  # "user" or "guest", whichever produced the current token
+        self._logged_in_as = (
+            ""  # "user" or "guest", whichever produced the current token
+        )
         self.last_auth_error = ""
 
     def _headers(self) -> dict[str, str]:
@@ -85,21 +89,31 @@ class TJClient:
         """Auth status for /health. Never includes tokens or the password."""
         return {
             "mode": self.auth_mode,
-            "logged_in_as": "static" if self.settings.bearer_token else self._logged_in_as or None,
+            "logged_in_as": "static"
+            if self.settings.bearer_token
+            else self._logged_in_as or None,
             "email": self.settings.login_email or None,
             "has_token": bool(self._token),
-            "valid_until": None if self._token_valid_until == float("inf") else int(self._token_valid_until) or None,
+            "valid_until": None
+            if self._token_valid_until == float("inf")
+            else int(self._token_valid_until) or None,
             "last_error": self.last_auth_error or None,
         }
 
     def _store_tokens(self, body: Any) -> None:
         # Guest login returns the fields at top level; accept a {data: {...}} wrapper too.
-        d = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
+        d = (
+            body.get("data")
+            if isinstance(body, dict) and isinstance(body.get("data"), dict)
+            else body
+        )
         token = (d or {}).get("token")
         if not token:
             raise UpstreamError("auth response has no token")
         self._token = token
-        self._token_valid_until = float(d.get("token_valid_until") or time.time() + 3600)
+        self._token_valid_until = float(
+            d.get("token_valid_until") or time.time() + 3600
+        )
         self._refresh_token = d.get("refresh_token") or self._refresh_token
         self._refresh_valid_until = float(d.get("refresh_token_valid_until") or 0)
 
@@ -108,11 +122,19 @@ class TJClient:
             return self.settings.bearer_token
         async with self._auth_lock:
             now = time.time()
-            if not force and self._token and now < self._token_valid_until - TOKEN_MARGIN_SECONDS:
+            if (
+                not force
+                and self._token
+                and now < self._token_valid_until - TOKEN_MARGIN_SECONDS
+            ):
                 return self._token
             if self._refresh_token and now < self._refresh_valid_until - 60:
                 try:
-                    body = await self._send("POST", "/v1/auth/token/refresh", json={"refresh_token": self._refresh_token})
+                    body = await self._send(
+                        "POST",
+                        "/v1/auth/token/refresh",
+                        json={"refresh_token": self._refresh_token},
+                    )
                     self._store_tokens(body)
                     log.info("upstream token refreshed")
                     return self._token
@@ -121,20 +143,32 @@ class TJClient:
             if self.auth_mode == "user":
                 try:
                     body = await self._send(
-                        "POST", "/v1/auth/login",
-                        json={"email": self.settings.login_email, "password": self.settings.login_password},
+                        "POST",
+                        "/v1/auth/login",
+                        json={
+                            "email": self.settings.login_email,
+                            "password": self.settings.login_password,
+                        },
                     )
                     self._store_tokens(body)
                     self._logged_in_as, self.last_auth_error = "user", ""
-                    log.info("logged in as %s, token valid until %s", self.settings.login_email, int(self._token_valid_until))
+                    log.info(
+                        "logged in as %s, token valid until %s",
+                        self.settings.login_email,
+                        int(self._token_valid_until),
+                    )
                     return self._token
                 except UpstreamError as e:
                     # Keep the public features working; /health shows why the account login failed.
                     self.last_auth_error = f"account login failed: {e}"
                     log.error("%s; falling back to guest", self.last_auth_error)
-            self._store_tokens(await self._send("POST", "/v1/auth/login/guest", json={}))
+            self._store_tokens(
+                await self._send("POST", "/v1/auth/login/guest", json={})
+            )
             self._logged_in_as = "guest"
-            log.info("logged in as guest, token valid until %s", int(self._token_valid_until))
+            log.info(
+                "logged in as guest, token valid until %s", int(self._token_valid_until)
+            )
             return self._token
 
     @property
@@ -147,13 +181,22 @@ class TJClient:
 
     # ---- HTTP ------------------------------------------------------------
 
-    async def _send(self, method: str, url: str, headers: dict[str, str] | None = None, **kwargs: Any) -> Any:
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
         try:
             resp = await self._http.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as e:
             raise UpstreamError(f"{method} {url}: {e}") from e
         if resp.status_code >= 400:
-            raise UpstreamError(f"{method} {url}: HTTP {resp.status_code} {resp.text[:200]}", resp.status_code)
+            raise UpstreamError(
+                f"{method} {url}: HTTP {resp.status_code} {resp.text[:200]}",
+                resp.status_code,
+            )
         try:
             return resp.json()
         except ValueError as e:
@@ -162,20 +205,31 @@ class TJClient:
     async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         token = await self._ensure_token()
         try:
-            return await self._send(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+            return await self._send(
+                method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs
+            )
         except UpstreamError as e:
             # Token revoked or expired early: get a new one once and retry.
             if e.status != 401 or self.settings.bearer_token:
                 raise
             token = await self._ensure_token(force=True)
-            return await self._send(method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+            return await self._send(
+                method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs
+            )
 
     @staticmethod
     def _area_payload(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
-        return {"latitude": lat, "longitude": lon, "radius": radius_km, "event": "change_loc"}
+        return {
+            "latitude": lat,
+            "longitude": lon,
+            "radius": radius_km,
+            "event": "change_loc",
+        }
 
     async def get_offline_buses(self, lat: float, lon: float, radius_km: float) -> Any:
-        body = await self._request("POST", "/v1/bus/offline", json=self._area_payload(lat, lon, radius_km))
+        body = await self._request(
+            "POST", "/v1/bus/offline", json=self._area_payload(lat, lon, radius_km)
+        )
         return (body or {}).get("data")
 
     async def get_bus_stops(self, lat: float, lon: float, radius_km: float) -> Any:

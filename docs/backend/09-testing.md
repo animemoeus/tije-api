@@ -144,35 +144,66 @@ Untuk mengubah UI tanpa menyentuh server TransJakarta, jalankan aplikasi dengan 
 
 ```python
 """Demo: aplikasi asli + upstream palsu + tiga bus berputar di sekitar Monas."""
+
 import math, time
 import httpx, uvicorn
 from app.config import Settings
 from app.main import create_app
 from app.upstream import TJClient
 
-ROUTES = [("TJ-0101", "1", "D32F2F"), ("TJ-0205", "2", "1565C0"), ("MK-1001", "JAK.10", "F9A825")]
+ROUTES = [
+    ("TJ-0101", "1", "D32F2F"),
+    ("TJ-0205", "2", "1565C0"),
+    ("MK-1001", "JAK.10", "F9A825"),
+]
+
 
 def buses_now():
     t = time.time()
     out = []
     for i, (no, route, color) in enumerate(ROUTES):
         a = t / 20 + i * 2
-        out.append({
-            "bus_body_no": no, "route_code": route, "route_color": color, "route_text_color": "FFFFFF",
-            "latitude": -6.1754 + 0.004 * math.sin(a), "longitude": 106.8272 + 0.005 * math.cos(a),
-            "bearing": (math.degrees(-a) + 360) % 360, "timestamp": int(t), "type": "brt", "next_stops": "H00001P-Monas",
-        })
+        out.append(
+            {
+                "bus_body_no": no,
+                "route_code": route,
+                "route_color": color,
+                "route_text_color": "FFFFFF",
+                "latitude": -6.1754 + 0.004 * math.sin(a),
+                "longitude": 106.8272 + 0.005 * math.cos(a),
+                "bearing": (math.degrees(-a) + 360) % 360,
+                "timestamp": int(t),
+                "type": "brt",
+                "next_stops": "H00001P-Monas",
+            }
+        )
     return out
+
 
 def upstream(req):
     if req.url.path == "/v1/auth/login/guest":
-        return httpx.Response(200, json={"token": "demo", "token_valid_until": time.time() + 86400})
+        return httpx.Response(
+            200, json={"token": "demo", "token_valid_until": time.time() + 86400}
+        )
     if req.url.path == "/v1/bus/offline":
         return httpx.Response(200, json={"data": buses_now()})
     if req.url.path == "/v2/bus-stop":
-        return httpx.Response(200, json={"data": [
-            {"stop_id": "1", "stop_name": "Monas", "stop_lat": -6.1767, "stop_lon": 106.8230, "bus_stop_type": "halte"}]})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "stop_id": "1",
+                        "stop_name": "Monas",
+                        "stop_lat": -6.1767,
+                        "stop_lon": 106.8230,
+                        "bus_stop_type": "halte",
+                    }
+                ]
+            },
+        )
     return httpx.Response(404)
+
 
 s = Settings(_env_file=None, bearer_token="")
 app = create_app(s, client=TJClient(s, transport=httpx.MockTransport(upstream)))

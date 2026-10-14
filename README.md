@@ -113,6 +113,20 @@ Header yang dikirim ke upstream (`X-App-Version`, `X-Device-ID`, `X-App-OS`, …
 
 Test memakai upstream palsu (`httpx.MockTransport`) dan mengabaikan `.env`, jadi tidak menghubungi server TransJakarta.
 
+## Lint & format
+
+Pakai [ruff](https://docs.astral.sh/ruff/). Pasang hook pre-commit sekali setelah install dependency:
+
+```powershell
+.\.venv\Scripts\pre-commit install
+```
+
+Setelah itu `ruff check --fix` dan `ruff format` jalan otomatis tiap commit. Untuk menjalankan manual ke semua file:
+
+```powershell
+.\.venv\Scripts\pre-commit run --all-files
+```
+
 ## Catatan
 
 - Sudah dicek ke server asli: login guest, `POST /v1/bus/offline`, `GET /v2/bus-stop`, dan `WS /ws` (snapshot tiap ±1,00 detik).

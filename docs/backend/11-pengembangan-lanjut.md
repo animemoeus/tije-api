@@ -36,13 +36,18 @@ Endpoint upstream: `GET /v2/bus-stop/{stop_id}` (`getHalteDetail` di app).
 `tests/test_api.py`, tambahkan cabang di `FakeTJ.__call__` lalu test-nya:
 
 ```python
-        if path == "/v2/bus-stop/H00278P":
-            return httpx.Response(200, json={"data": {"stop_id": "H00278P", "stop_name": "Harmoni"}})
+if path == "/v2/bus-stop/H00278P":
+    return httpx.Response(
+        200, json={"data": {"stop_id": "H00278P", "stop_name": "Harmoni"}}
+    )
 ```
 
 ```python
 def test_stop_detail(client):
-    assert client.get("/stops/H00278P").json() == {"stop_id": "H00278P", "stop_name": "Harmoni"}
+    assert client.get("/stops/H00278P").json() == {
+        "stop_id": "H00278P",
+        "stop_name": "Harmoni",
+    }
 ```
 
 ### Contoh: endpoint yang butuh akun

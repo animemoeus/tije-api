@@ -47,20 +47,36 @@ def normalize_route(route_code: str, data: Any) -> dict[str, Any]:
         if not isinstance(d, dict):
             continue
         stops = [
-            {"stop_id": s.get("stop_id"), "name": s.get("stop_name"), "lat": s.get("stop_lat"), "lon": s.get("stop_lon"),
-             "type": s.get("bus_stop_type")}
+            {
+                "stop_id": s.get("stop_id"),
+                "name": s.get("stop_name"),
+                "lat": s.get("stop_lat"),
+                "lon": s.get("stop_lon"),
+                "type": s.get("bus_stop_type"),
+            }
             for s in d.get("stops") or []
-            if isinstance(s, dict) and s.get("stop_lat") is not None and s.get("stop_lon") is not None
+            if isinstance(s, dict)
+            and s.get("stop_lat") is not None
+            and s.get("stop_lon") is not None
         ]
         poly = d.get("polyline")
         path = decode_polyline(poly) if isinstance(poly, str) else []
         # No geometry upstream: fall back to straight lines between stops.
         if len(path) < 2:
             path = [[s["lat"], s["lon"]] for s in stops]
-        directions.append({"direction": name, "trip_id": d.get("trip_id"), "headsign": d.get("headsign"),
-                           "path": path, "stops": stops})
+        directions.append(
+            {
+                "direction": name,
+                "trip_id": d.get("trip_id"),
+                "headsign": d.get("headsign"),
+                "path": path,
+                "stops": stops,
+            }
+        )
     return {
-        "route_code": route.get("route_short_name") or route.get("route_id") or route_code,
+        "route_code": route.get("route_short_name")
+        or route.get("route_id")
+        or route_code,
         "route_name": route.get("route_long_name"),
         "route_type": route.get("route_desc"),
         "route_color": route.get("route_color"),

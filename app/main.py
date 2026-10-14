@@ -12,12 +12,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import Settings, settings as default_settings
+from .config import Settings
+from .config import settings as default_settings
 from .routes import normalize_route
 from .tracker import Tracker, parse_routes, route_matches
 from .upstream import TJClient, UpstreamError
@@ -25,8 +32,8 @@ from .upstream import TJClient, UpstreamError
 log = logging.getLogger("tj")
 
 # Jakarta-ish bounds, to reject obviously wrong coordinates early.
-LAT = dict(ge=-7.5, le=-5.5)
-LON = dict(ge=106.0, le=107.5)
+LAT = {"ge": -7.5, "le": -5.5}
+LON = {"ge": 106.0, "le": 107.5}
 
 
 def create_app(
@@ -41,24 +48,40 @@ def create_app(
         # (lat, lon, r) rounded -> {"lat", "lon", "r", "last", "polled", "subscribers", "busy"}
         app.state.areas = {}
         app.state.routes = {}  # route code -> (fetched_at, normalized route)
-        tasks = [asyncio.create_task(_prune_loop(app.state.tracker)), asyncio.create_task(_poll_loop(app, settings))]
+        tasks = [
+            asyncio.create_task(_prune_loop(app.state.tracker)),
+            asyncio.create_task(_poll_loop(app, settings)),
+        ]
         yield
         for t in tasks:
             t.cancel()
         await app.state.client.aclose()
 
     app = FastAPI(title="TJ Live Tracking API", version="0.1.0", lifespan=lifespan)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"]
+    )
 
     def radius_param(radius_km: float | None) -> float:
         r = radius_km or settings.default_radius_km
         return min(r, settings.max_radius_km)
 
-    async def track_area(request_app: FastAPI, lat: float, lon: float, radius_km: float) -> dict[str, Any]:
+    async def track_area(
+        request_app: FastAPI, lat: float, lon: float, radius_km: float
+    ) -> dict[str, Any]:
         """Register an area and poll it now unless a recent poll already covers it."""
         key = (round(lat, 3), round(lon, 3), radius_km)
         entry = request_app.state.areas.setdefault(
-            key, {"lat": lat, "lon": lon, "r": radius_km, "polled": 0.0, "subscribers": 0, "busy": False})
+            key,
+            {
+                "lat": lat,
+                "lon": lon,
+                "r": radius_km,
+                "polled": 0.0,
+                "subscribers": 0,
+                "busy": False,
+            },
+        )
         entry["last"] = time.monotonic()
         if time.monotonic() - entry["polled"] >= settings.poll_seconds:
             first = entry["polled"] == 0.0
@@ -70,7 +93,11 @@ def create_app(
                 log.warning("poll failed: %s", e)
         return entry
 
-    app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
+    app.mount(
+        "/ui",
+        StaticFiles(directory=Path(__file__).parent / "static", html=True),
+        name="ui",
+    )
 
     @app.get("/", include_in_schema=False)
     async def root() -> RedirectResponse:
@@ -82,8 +109,12 @@ def create_app(
         return {
             "status": "ok",
             "auth": request.app.state.client.token_info(),
-            "tracker": {**request.app.state.tracker.stats(), "areas": len(areas),
-                        "ws_clients": sum(a["subscribers"] for a in areas), "poll_seconds": settings.poll_seconds},
+            "tracker": {
+                **request.app.state.tracker.stats(),
+                "areas": len(areas),
+                "ws_clients": sum(a["subscribers"] for a in areas),
+                "poll_seconds": settings.poll_seconds,
+            },
         }
 
     @app.get("/buses")
@@ -92,7 +123,10 @@ def create_app(
         lat: float = Query(..., **LAT),
         lon: float = Query(..., **LON),
         radius_km: float | None = Query(None, gt=0),
-        routes: str | None = Query(None, description="Comma-separated route codes to keep, e.g. 4,4D (exact, case-insensitive)"),
+        routes: str | None = Query(
+            None,
+            description="Comma-separated route codes to keep, e.g. 4,4D (exact, case-insensitive)",
+        ),
     ) -> dict[str, Any]:
         """Live buses near a point, nearest first. `routes_available` lists every route in the area, before filtering."""
         r = radius_param(radius_km)
@@ -117,7 +151,9 @@ def create_app(
     ) -> Any:
         """Upstream POST /v1/bus/offline, passed through as-is."""
         try:
-            return await request.app.state.client.get_offline_buses(lat, lon, radius_param(radius_km))
+            return await request.app.state.client.get_offline_buses(
+                lat, lon, radius_param(radius_km)
+            )
         except UpstreamError as e:
             raise HTTPException(502, f"upstream error: {e}") from e
 
@@ -126,7 +162,9 @@ def create_app(
         """Latest known state of one bus (must be inside an area some client is tracking)."""
         item = request.app.state.tracker.to_public(bus_body_no)
         if not item:
-            raise HTTPException(404, "bus not seen recently; query /buses for its area first")
+            raise HTTPException(
+                404, "bus not seen recently; query /buses for its area first"
+            )
         return item
 
     @app.get("/stops")
@@ -138,7 +176,9 @@ def create_app(
     ) -> Any:
         """Upstream GET /v2/bus-stop (halte and bus stops near a point), passed through as-is."""
         try:
-            return await request.app.state.client.get_bus_stops(lat, lon, radius_param(radius_km))
+            return await request.app.state.client.get_bus_stops(
+                lat, lon, radius_param(radius_km)
+            )
         except UpstreamError as e:
             raise HTTPException(502, f"upstream error: {e}") from e
 
@@ -173,7 +213,10 @@ def create_app(
     @app.get("/routes")
     async def routes_by_type(
         request: Request,
-        type: str = Query(..., description="Route type as upstream names it in route_desc, e.g. BRT, Mikrotrans"),
+        type: str = Query(
+            ...,
+            description="Route type as upstream names it in route_desc, e.g. BRT, Mikrotrans",
+        ),
     ) -> dict[str, Any]:
         """Path and stops of every route of one type, e.g. all BRT corridors. Routes whose detail fails are left out."""
 
@@ -185,9 +228,13 @@ def create_app(
 
         listing = await cached(request.app, "__list__", fetch_list)
         wanted = type.strip().lower()
-        codes = [str(r.get("route_short_name") or r.get("route_id")) for r in listing
-                 if isinstance(r, dict) and str(r.get("route_desc") or "").strip().lower() == wanted
-                 and (r.get("route_short_name") or r.get("route_id"))]
+        codes = [
+            str(r.get("route_short_name") or r.get("route_id"))
+            for r in listing
+            if isinstance(r, dict)
+            and str(r.get("route_desc") or "").strip().lower() == wanted
+            and (r.get("route_short_name") or r.get("route_id"))
+        ]
         limit = asyncio.Semaphore(5)
 
         async def one(code: str) -> dict[str, Any] | None:
@@ -199,7 +246,10 @@ def create_app(
                     return None
 
         found = [r for r in await asyncio.gather(*map(one, codes)) if r]
-        return {"type": type.strip(), "routes": sorted(found, key=lambda r: _natural_key(str(r["route_code"])))}
+        return {
+            "type": type.strip(),
+            "routes": sorted(found, key=lambda r: _natural_key(str(r["route_code"]))),
+        }
 
     @app.get("/routes/{route_code}")
     async def route_detail(request: Request, route_code: str) -> dict[str, Any]:
@@ -214,14 +264,23 @@ def create_app(
         return request.app.state.client.token_info()
 
     @app.get("/account/trips")
-    async def account_trips(request: Request, page: int = Query(1, ge=1), limit: int = Query(10, ge=1, le=50)) -> Any:
+    async def account_trips(
+        request: Request,
+        page: int = Query(1, ge=1),
+        limit: int = Query(10, ge=1, le=50),
+    ) -> Any:
         """Trip history of the configured TransJakarta account (GET /v1/user/trips). Needs TJ_LOGIN_EMAIL/PASSWORD."""
         client: TJClient = request.app.state.client
         try:
             await client._ensure_token()
             if not client.is_user_session:
-                raise HTTPException(403, "needs a TransJakarta account: set TJ_LOGIN_EMAIL and TJ_LOGIN_PASSWORD in .env")
-            return await client.request("GET", "/v1/user/trips", params={"page": page, "limit": limit})
+                raise HTTPException(
+                    403,
+                    "needs a TransJakarta account: set TJ_LOGIN_EMAIL and TJ_LOGIN_PASSWORD in .env",
+                )
+            return await client.request(
+                "GET", "/v1/user/trips", params={"page": page, "limit": limit}
+            )
         except UpstreamError as e:
             raise HTTPException(502, f"upstream error: {e}") from e
 
@@ -256,7 +315,12 @@ def create_app(
             next_at = loop.time()
             while True:
                 entry["last"] = time.monotonic()
-                await websocket.send_json({"type": "snapshot", "buses": tracker.buses_near(lat, lon, r, wanted)})
+                await websocket.send_json(
+                    {
+                        "type": "snapshot",
+                        "buses": tracker.buses_near(lat, lon, r, wanted),
+                    }
+                )
                 next_at += settings.poll_seconds
                 await asyncio.sleep(max(0.0, next_at - loop.time()))
 
@@ -278,14 +342,24 @@ def route_summary(buses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         code = str(b.get("route_code") or "").strip()
         if not code:
             continue
-        e = acc.setdefault(code, {"route_code": code, "route_color": b.get("route_color"),
-                                  "route_text_color": b.get("route_text_color"), "count": 0})
+        e = acc.setdefault(
+            code,
+            {
+                "route_code": code,
+                "route_color": b.get("route_color"),
+                "route_text_color": b.get("route_text_color"),
+                "count": 0,
+            },
+        )
         e["count"] += 1
     return sorted(acc.values(), key=lambda e: _natural_key(e["route_code"]))
 
 
 def _natural_key(code: str) -> list[Any]:
-    return [(0, int(p), "") if p.isdigit() else (1, 0, p.upper()) for p in re.findall(r"\d+|\D+", code)]
+    return [
+        (0, int(p), "") if p.isdigit() else (1, 0, p.upper())
+        for p in re.findall(r"\d+|\D+", code)
+    ]
 
 
 async def _poll_area(app: FastAPI, entry: dict[str, Any]) -> None:
@@ -294,7 +368,9 @@ async def _poll_area(app: FastAPI, entry: dict[str, Any]) -> None:
         return
     entry["busy"] = True
     try:
-        buses = await app.state.client.get_offline_buses(entry["lat"], entry["lon"], entry["r"])
+        buses = await app.state.client.get_offline_buses(
+            entry["lat"], entry["lon"], entry["r"]
+        )
         entry["polled"] = time.monotonic()
     finally:
         entry["busy"] = False
@@ -336,5 +412,7 @@ async def _prune_loop(tracker: Tracker) -> None:
         tracker.prune()
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 app = create_app()
