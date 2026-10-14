@@ -5,6 +5,7 @@ Endpoints and payloads come from the app's Hermes bundle (v3.0.4):
   token refresh        POST /v1/auth/token/refresh {refresh_token}
   getBusNearestOffline POST /v1/bus/offline {latitude, longitude, radius, event:"change_loc"} -> data: [bus, ...]
   getSearchBusStopNew  GET  /v2/bus-stop?latitude&longitude&radius
+  (route list)         GET  /v2/route -> data: {routes: [{route_id, route_short_name, route_desc, ...}]}
   getRouteDetail       GET  /v2/route/{route_code} -> data: {route, inbound, outbound, loop}
 
   login                POST /v1/auth/login {email, password} -> same token fields as guest login
@@ -181,6 +182,13 @@ class TJClient:
         params = {"latitude": lat, "longitude": lon, "radius": radius_km}
         body = await self._request("GET", "/v2/bus-stop", params=params)
         return (body or {}).get("data")
+
+    async def list_routes(self) -> list[Any]:
+        """Every route (one page holds all of them), without geometry. `route_desc` is the type: BRT, Mikrotrans, ..."""
+        body = await self._request("GET", "/v2/route")
+        data = (body or {}).get("data")
+        routes = data.get("routes") if isinstance(data, dict) else None
+        return routes if isinstance(routes, list) else []
 
     async def get_route(self, route_code: str) -> Any:
         """Route detail with stops and polyline per direction. Unknown codes give HTTP 404."""

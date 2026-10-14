@@ -18,7 +18,7 @@ python/
 ├── docs/                 dokumentasi ini
 └── tests/
     ├── __init__.py
-    └── test_api.py       23 test, upstream palsu
+    └── test_api.py       24 test, upstream palsu
 ```
 
 Ketergantungan antar modul hanya satu arah:

@@ -472,6 +472,38 @@ Upstream membatasi hasil 20 halte per permintaan (`meta.limit = 20`).
 
 ---
 
+## `GET /routes`
+
+Jalur semua rute dengan satu jenis, misalnya semua koridor BRT. Dipakai UI untuk selalu menggambar koridor BRT.
+
+**Parameter query**: `type` (wajib), jenis rute seperti di `route_desc` upstream: `BRT`, `Mikrotrans`, `Angkutan Umum Integrasi`, `Transjabodetabek`, `Rusun`, `Royaltrans`, `Bus Wisata`. Tidak peka huruf besar-kecil.
+
+Backend mengambil daftar rute dari `GET /v2/route` (237 rute, 30 di antaranya BRT), lalu detail setiap rute yang cocok dari `GET /v2/route/{code}`, paling banyak 5 sekaligus. Daftar dan detail di-cache selama `TJ_ROUTE_CACHE_SECONDS`. Permintaan pertama untuk BRT butuh sekitar 2 detik; setelah itu dijawab dari cache. Rute yang detailnya gagal diambil dilewati dan dicatat di log.
+
+**Request**
+
+```powershell
+curl "http://localhost:8000/routes?type=BRT"
+```
+
+**Response 200** (sekitar 400 KB untuk BRT)
+
+```json
+{
+  "type": "BRT",
+  "routes": [
+    { "route_code": "1", "route_name": "Blok M - Kota", "route_type": "BRT", "route_color": "D62126", "route_text_color": "FFFFFF", "directions": ["..."] },
+    "... (30 item total)"
+  ]
+}
+```
+
+Setiap item berbentuk sama dengan respons `GET /routes/{route_code}`, diurutkan alami (1, 2, 2A, …, 14, L13E).
+
+**Error**: 422 kalau `type` kosong, 502 kalau daftar rute gagal diambil.
+
+---
+
 ## `GET /routes/{route_code}`
 
 Jalur rute beserta haltenya per arah, untuk menggambar rute di peta. Diambil dari `GET /v2/route/{route_code}` upstream, lalu diringkas: polyline upstream (Google encoded polyline, 5 desimal) sudah di-decode menjadi daftar koordinat. Hasil disimpan di memori selama `TJ_ROUTE_CACHE_SECONDS` (bawaan 1 jam).

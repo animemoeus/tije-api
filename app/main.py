@@ -142,27 +142,71 @@ def create_app(
         except UpstreamError as e:
             raise HTTPException(502, f"upstream error: {e}") from e
 
+    async def cached(request_app: FastAPI, key: str, fetch: Any) -> Any:
+        """`await fetch()`, kept in app.state.routes for route_cache_seconds."""
+        cache: dict[str, tuple[float, Any]] = request_app.state.routes
+        hit = cache.get(key)
+        if hit and time.monotonic() - hit[0] < settings.route_cache_seconds:
+            return hit[1]
+        value = await fetch()
+        cache[key] = (time.monotonic(), value)
+        return value
+
+    async def get_route(request_app: FastAPI, route_code: str) -> dict[str, Any]:
+        """Normalized route, cached. HTTPException 404 for unknown codes or routes without a path, 502 upstream errors."""
+        code = route_code.strip().upper()
+
+        async def fetch() -> dict[str, Any]:
+            try:
+                data = await request_app.state.client.get_route(code)
+            except UpstreamError as e:
+                if e.status == 404:
+                    raise HTTPException(404, f"route {code} not found") from e
+                raise HTTPException(502, f"upstream error: {e}") from e
+            route = normalize_route(code, data)
+            if not route["directions"]:
+                raise HTTPException(404, f"route {code} has no path")
+            return route
+
+        return await cached(request_app, code, fetch)
+
+    @app.get("/routes")
+    async def routes_by_type(
+        request: Request,
+        type: str = Query(..., description="Route type as upstream names it in route_desc, e.g. BRT, Mikrotrans"),
+    ) -> dict[str, Any]:
+        """Path and stops of every route of one type, e.g. all BRT corridors. Routes whose detail fails are left out."""
+
+        async def fetch_list() -> list[Any]:
+            try:
+                return await request.app.state.client.list_routes()
+            except UpstreamError as e:
+                raise HTTPException(502, f"upstream error: {e}") from e
+
+        listing = await cached(request.app, "__list__", fetch_list)
+        wanted = type.strip().lower()
+        codes = [str(r.get("route_short_name") or r.get("route_id")) for r in listing
+                 if isinstance(r, dict) and str(r.get("route_desc") or "").strip().lower() == wanted
+                 and (r.get("route_short_name") or r.get("route_id"))]
+        limit = asyncio.Semaphore(5)
+
+        async def one(code: str) -> dict[str, Any] | None:
+            async with limit:
+                try:
+                    return await get_route(request.app, code)
+                except HTTPException as e:
+                    log.warning("route %s skipped: %s", code, e.detail)
+                    return None
+
+        found = [r for r in await asyncio.gather(*map(one, codes)) if r]
+        return {"type": type.strip(), "routes": sorted(found, key=lambda r: _natural_key(str(r["route_code"])))}
+
     @app.get("/routes/{route_code}")
     async def route_detail(request: Request, route_code: str) -> dict[str, Any]:
         """Route path and stops per direction (upstream GET /v2/route/{code}), for drawing a route on the map.
 
         Match a bus to a direction by its `trip_id`. Cached for `route_cache_seconds`."""
-        code = route_code.strip().upper()
-        cache: dict[str, tuple[float, dict[str, Any]]] = request.app.state.routes
-        hit = cache.get(code)
-        if hit and time.monotonic() - hit[0] < settings.route_cache_seconds:
-            return hit[1]
-        try:
-            data = await request.app.state.client.get_route(code)
-        except UpstreamError as e:
-            if e.status == 404:
-                raise HTTPException(404, f"route {code} not found") from e
-            raise HTTPException(502, f"upstream error: {e}") from e
-        route = normalize_route(code, data)
-        if not route["directions"]:
-            raise HTTPException(404, f"route {code} has no path")
-        cache[code] = (time.monotonic(), route)
-        return route
+        return await get_route(request.app, route_code)
 
     @app.get("/account")
     async def account(request: Request) -> dict[str, Any]:

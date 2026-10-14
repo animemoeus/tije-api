@@ -56,6 +56,9 @@
     .next { font-size: 13px; } .meta { color: var(--muted); font-size: 12px; }
     #map { height: 100%; width: 100%; }
     .bus-icon { display: flex; align-items: center; justify-content: center; }
+    /* While one bus is highlighted, the others step back. */
+    #map.focus .bus-icon:not(.sel) { opacity: .35; }
+    #map.focus .bus-icon.sel { z-index: 10000 !important; }
     .bus-icon .pin { position: relative; min-width: 30px; padding: 2px 4px; border-radius: 6px; border: 2px solid #fff;
       font: 700 11px system-ui, sans-serif; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
     .bus-icon .arrow { position: absolute; left: 50%; top: 50%; width: 0; height: 0;
@@ -99,7 +102,7 @@
       </div>
       <div id="routeChips" class="chips"></div>
       <div id="routeBar" class="routebar" hidden><div id="routeInfo"></div><button id="routeHide" class="mini">Tutup</button></div>
-      <p class="hint">Klik peta untuk memilih titik pantau. Klik kode jalur untuk menyaring. Tombol <b>Jalur</b> di bus menggambar rute yang akan dilewatinya.</p>
+      <p class="hint">Klik peta untuk memilih titik pantau. Klik kode jalur untuk menyaring. Klik bus untuk menyorot jalurnya sampai tujuan.</p>
     </div>
     <div id="list" class="list"><div class="empty">Belum ada bus di area ini.</div></div>
   </aside>
@@ -153,8 +156,9 @@
     const rot = Number(b.bearing) || 0;
     const label = String(b.route_code || "?");
     const w = Math.max(36, label.length * 8 + 14);
+    const sel = state.route && state.route.busNo === b.bus_body_no;
     return L.divIcon({
-      className: "bus-icon", iconSize: [w, 22], iconAnchor: [w / 2, 11],
+      className: sel ? "bus-icon sel" : "bus-icon", iconSize: [w, 22], iconAnchor: [w / 2, 11],
       html: `<div class="pin" style="background:${bg};color:${fg}">${esc(label)}` +
             // Arrow orbits outside the pin, so it never covers the label.
       `<span class="arrow" style="margin:-${w / 2 + 12}px 0 0 -5px;transform-origin:5px ${w / 2 + 12}px;transform:rotate(${rot}deg)"></span></div>`,
@@ -174,8 +178,7 @@
   function popupHtml(b) {
     return `<b>${esc(b.route_code)}</b> ${b.trip_headsign ? "→ " + esc(b.trip_headsign) : ""} · ${esc(b.type)}<br>` +
            `<small>${esc(b.bus_body_no)}</small><br>` +
-           `Berikutnya: <b>${esc(b.next_stop_name || "-")}</b><br>${esc(nextInfo(b))}` +
-           `<div style="margin-top:6px"><button class="mini showRoute" data-no="${esc(b.bus_body_no)}">Lihat jalur</button></div>`;
+           `Berikutnya: <b>${esc(b.next_stop_name || "-")}</b><br>${esc(nextInfo(b))}`;
   }
 
   // Markers of filtered-out routes stay in memory but off the map, so toggling the filter is instant.
@@ -196,7 +199,11 @@
       entry.marker.setLatLng([b.latitude, b.longitude]).setIcon(busIcon(b)).setPopupContent(popupHtml(b));
       if (state.route && state.route.busNo === b.bus_body_no && state.route.data) redrawRoute();
     } else {
-      const marker = L.marker([b.latitude, b.longitude], { icon: busIcon(b) }).bindPopup(popupHtml(b));
+      const no = b.bus_body_no;
+      // Opening a bus (marker or list click) highlights its way ahead; closing it brings every route back.
+      const marker = L.marker([b.latitude, b.longitude], { icon: busIcon(b) }).bindPopup(popupHtml(b))
+        .on("popupopen", () => showBusRoute(no))
+        .on("popupclose", () => { if (state.route && state.route.busNo === no) hideRoute(); });
       entry = { data: b, marker, seen: Date.now() };
       state.buses.set(b.bus_body_no, entry);
     }
@@ -294,8 +301,7 @@
       return `<div class="bus" data-no="${esc(b.bus_body_no)}">
         <div class="top"><span class="chip" style="background:${bg};color:${fg}">${esc(b.route_code || "?")}</span>
           <span class="chip type">${esc(b.type)}</span>${b.trip_headsign ? `<span>→ ${esc(b.trip_headsign)}</span>` : ""}
-          <span class="no">${esc(b.bus_body_no)}</span>
-          <button class="mini showRoute" data-no="${esc(b.bus_body_no)}" title="Gambar jalur yang akan dilewati">Jalur</button></div>
+          <span class="no">${esc(b.bus_body_no)}</span></div>
         <div class="next">Berikutnya: <b>${esc(b.next_stop_name || "-")}</b></div>
         <div class="meta">${esc([nextInfo(b), dist ? dist + " dari titik" : ""].filter(Boolean).join(" · "))}</div>
       </div>`;
@@ -308,13 +314,48 @@
     if (entry) { map.panTo(entry.marker.getLatLng()); entry.marker.openPopup(); }
   });
 
-  // ---- Route lines (GET /routes/{code}) ----------------------------------
-  // state.route = {codes, busNo, bus, data} for what is drawn; null when nothing is.
+  // ---- Route lines (GET /routes, GET /routes/{code}) ---------------------
+  // Every BRT corridor is always drawn in baseLayer. state.route = {codes, busNo, bus, data} is what is
+  // highlighted on top in routeLayer (null when nothing is); while it is set, baseLayer turns grey.
+  const baseLayer = L.layerGroup().addTo(map);
   const routeLayer = L.layerGroup().addTo(map);
   const routeCache = new Map(); // code -> Promise<route>
   const MAX_ROUTES_DRAWN = 6;
+  const GREY = "#9aa5b1";
+  const BASE_STYLE = { weight: 4, opacity: 0.75 };
+
+  async function loadBaseRoutes() {
+    try {
+      const res = await fetch(new URL("/routes?type=BRT", API));
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      for (const r of body.routes) {
+        routeCache.set(String(r.route_code).toUpperCase(), Promise.resolve(r));
+        const c = color(r.route_color, "#174ca1");
+        for (const d of r.directions) {
+          L.polyline(d.path, { ...BASE_STYLE, color: c, routeColor: c, interactive: false }).addTo(baseLayer);
+        }
+      }
+      setFocus(!!state.route);
+    } catch (err) {
+      setRouteBar(`Gagal memuat rute BRT: ${esc(err.message)}`, true);
+    }
+  }
+
+  // Grey out every corridor (and every other bus) while something is highlighted.
+  function setFocus(on) {
+    baseLayer.eachLayer((l) => l.setStyle(on ? { color: GREY, opacity: 0.45 } : { color: l.options.routeColor, opacity: BASE_STYLE.opacity }));
+    $("map").classList.toggle("focus", on);
+  }
+
+  // Re-render a bus marker so its "sel" class follows the selection.
+  function refreshIcon(no) {
+    const entry = no && state.buses.get(no);
+    if (entry) entry.marker.setIcon(busIcon(entry.data));
+  }
 
   function fetchRoute(code) {
+    code = String(code).toUpperCase();
     if (!routeCache.has(code)) {
       const p = fetch(new URL("/routes/" + encodeURIComponent(code), API)).then(async (res) => {
         const body = await res.json().catch(() => ({}));
@@ -438,20 +479,28 @@
       const seen = new Set();
       for (const d of dirs) {
         const prog = bus ? progress(d, bus) : null;
-        if (prog) info = { route: r, dir: d, prog };
-        // Whole direction; with a bus, faded, plus the part still ahead of the bus drawn thick on top.
-        L.polyline(d.path, { color: c, weight: prog ? 4 : 5, opacity: prog ? 0.35 : 0.8, interactive: false }).addTo(routeLayer);
-        if (prog) L.polyline(aheadPath(d, prog), { color: c, weight: 7, opacity: 0.95, interactive: false }).addTo(routeLayer);
+        if (prog) {
+          // Only the way from the bus to the end of its trip keeps the route colour; its stops get tooltips, not
+          // popups, because opening a popup would close the bus popup and end the highlight.
+          info = { route: r, dir: d, prog };
+          const ahead = aheadPath(d, prog);
+          L.polyline(ahead, { color: c, weight: 7, opacity: 0.95, interactive: false }).addTo(routeLayer);
+          ahead.forEach((p) => bounds.extend(p));
+          d.stops.forEach((s, k) => {
+            if (k < prog.next || k > prog.end) return;
+            L.circleMarker([s.lat, s.lon], { radius: 5, color: c, weight: 2, fillColor: "#fff", fillOpacity: 1, bubblingMouseEvents: false })
+              .bindTooltip(`<b>${esc(s.name)}</b> · ${k - prog.next + 1} halte lagi`)
+              .addTo(routeLayer);
+          });
+          continue;
+        }
+        L.polyline(d.path, { color: c, weight: 5, opacity: 0.85, interactive: false }).addTo(routeLayer);
         d.path.forEach((p) => bounds.extend(p));
         d.stops.forEach((s, k) => {
           if (seen.has(s.stop_id)) return;
           seen.add(s.stop_id);
-          // Faded: already passed, or beyond where this trip ends.
-          const passed = prog && (k < prog.next || k > prog.end);
-          const left = prog && !passed ? ` · ${k - prog.next + 1} halte lagi` : "";
-          L.circleMarker([s.lat, s.lon], { radius: 5, color: c, weight: 2, fillColor: "#fff", fillOpacity: passed ? 0.4 : 1,
-            opacity: passed ? 0.4 : 1, bubblingMouseEvents: false })
-            .bindPopup(`<b>${esc(s.name)}</b><br>${esc(r.route_code)} → ${esc(d.headsign || "-")} · halte ${k + 1}/${d.stops.length}${left}`)
+          L.circleMarker([s.lat, s.lon], { radius: 5, color: c, weight: 2, fillColor: "#fff", fillOpacity: 1, bubblingMouseEvents: false })
+            .bindPopup(`<b>${esc(s.name)}</b><br>${esc(r.route_code)} → ${esc(d.headsign || "-")} · halte ${k + 1}/${d.stops.length}`)
             .addTo(routeLayer);
         });
       }
@@ -488,15 +537,20 @@
 
   async function showRoute(codes, busNo = null) {
     const token = (state.routeToken = (state.routeToken || 0) + 1);
-    const entry = busNo && state.buses.get(busNo);
+    const entry = busNo && state.buses.get(busNo), prevBus = state.route && state.route.busNo;
     state.route = { codes, busNo, bus: entry ? entry.data : null, data: null };
+    if (prevBus !== busNo) { refreshIcon(prevBus); refreshIcon(busNo); }
+    routeLayer.clearLayers();
+    setFocus(true);
     setRouteBar(`Memuat jalur ${esc(codes.join(", "))}…`);
     try {
       const data = await Promise.all(codes.map(fetchRoute));
       if (token !== state.routeToken) return; // Another route was picked meanwhile.
       state.route.data = data;
       const bounds = redrawRoute();
-      if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
+      if (entry) bounds.extend(entry.marker.getLatLng());
+      // Zoom out only when the highlighted part does not fit the current view.
+      if (bounds.isValid() && !map.getBounds().contains(bounds)) map.fitBounds(bounds, { padding: [30, 30] });
     } catch (err) {
       if (token !== state.routeToken) return;
       routeLayer.clearLayers();
@@ -505,33 +559,34 @@
   }
 
   function hideRoute() {
+    const prevBus = state.route && state.route.busNo;
     state.routeToken = (state.routeToken || 0) + 1;
     state.route = null;
+    refreshIcon(prevBus);
     routeLayer.clearLayers();
+    setFocus(false);
     $("routeBar").hidden = true;
   }
 
   function showBusRoute(no) {
     const entry = state.buses.get(no);
     if (!entry || !entry.data.route_code) return;
-    map.closePopup();
+    if (state.route && state.route.busNo === no) return; // Popup re-opened for the bus already highlighted.
     showRoute([String(entry.data.route_code).trim()], no);
   }
-
-  // Capture phase: Leaflet popups stop click propagation, and the list's own handler should not also pan.
-  document.addEventListener("click", (e) => {
-    const btn = e.target.closest && e.target.closest(".showRoute");
-    if (!btn) return;
-    e.stopPropagation();
-    showBusRoute(btn.dataset.no);
-  }, true);
 
   $("routeShow").addEventListener("click", () => {
     const codes = [...state.routes].sort(byRoute);
     if (!codes.length) return setRouteBar("Pilih jalur dulu: ketik kodenya di kolom Jalur atau klik chip.", true);
+    map.closePopup();
     showRoute(codes.slice(0, MAX_ROUTES_DRAWN));
   });
-  $("routeHide").addEventListener("click", hideRoute);
+  $("routeHide").addEventListener("click", () => {
+    // Closing the bus popup also ends the highlight (popupclose), so do both in one go.
+    map.closePopup();
+    hideRoute();
+  });
+  loadBaseRoutes();
 
   function connect() {
     clearTimeout(state.timer);

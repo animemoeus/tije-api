@@ -29,6 +29,12 @@ ROUTE_1 = {
                            {"stop_id": "H00278P", "stop_name": "Harmoni", "stop_lat": -6.1655, "stop_lon": 106.8205}]},
     "loop": None,
 }
+ROUTE_LIST = [
+    {"route_id": "10", "route_short_name": "10", "route_desc": "BRT"},
+    {"route_id": "1", "route_short_name": "1", "route_desc": "BRT"},
+    {"route_id": "2", "route_short_name": "2", "route_desc": "BRT"},
+    {"route_id": "JAK.10", "route_short_name": "JAK.10", "route_desc": "Mikrotrans"},
+]
 
 
 class FakeTJ:
@@ -43,6 +49,7 @@ class FakeTJ:
         self.offline_buses: list[dict] = []
         self.user_tokens: set[str] = set()
         self.route_status = 200
+        self.missing_routes: set[str] = set()
 
     def _tokens(self):
         self.issued += 1
@@ -75,7 +82,11 @@ class FakeTJ:
             if self.offline_status != 200:
                 return httpx.Response(self.offline_status, text="boom")
             return httpx.Response(200, json={"code": 200, "data": self.offline_buses})
+        if path == "/v2/route":
+            return httpx.Response(200, json={"code": 200, "data": {"routes": ROUTE_LIST}})
         if path.startswith("/v2/route/"):
+            if path in self.missing_routes:
+                return httpx.Response(404, json={"code": 404, "message": "Rute tidak ditemukan"})
             if self.route_status != 200:
                 return httpx.Response(self.route_status, json={"code": self.route_status, "message": "Rute tidak ditemukan"})
             return httpx.Response(200, json={"code": 200, "data": ROUTE_1})
@@ -302,6 +313,20 @@ def test_route_detail_errors(client, fake):
     assert client.get("/routes/XYZ").status_code == 404
     fake.route_status = 500
     assert client.get("/routes/ABC").status_code == 502
+
+
+def test_routes_by_type(client, fake):
+    fake.missing_routes = {"/v2/route/2"}
+    body = client.get("/routes", params={"type": "brt"}).json()
+    # Only BRT, failed detail left out. FakeTJ answers every code with route 1, so check the codes requested.
+    assert len(body["routes"]) == 2
+    asked = sorted(p for p in fake.paths() if p.startswith("/v2/route/"))
+    assert asked == ["/v2/route/1", "/v2/route/10", "/v2/route/2"]
+    n = len(fake.calls)
+    client.get("/routes", params={"type": "BRT"})
+    # List and details come from the cache; only the missing route is asked again.
+    assert fake.paths()[n:] == ["/v2/route/2"]
+    assert client.get("/routes").status_code == 422
 
 
 def test_poll_fields(client, fake):
