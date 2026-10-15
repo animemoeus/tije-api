@@ -1,6 +1,6 @@
 #!/bin/sh
 # Format staged Rust files with rustfmt and re-stage them.
-# ponytail: re-adding a partially staged file stages its unstaged hunks too; use the pre-commit framework if that bites.
+# TODO: re-adding a partially staged file stages its unstaged hunks too; use the pre-commit framework if that bites.
 files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
 [ -z "$files" ] && exit 0
 echo "$files" | xargs rustfmt --edition 2024 || exit 1

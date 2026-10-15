@@ -1,18 +1,22 @@
 mod config;
+mod live;
 mod upstream;
 
 use std::sync::Arc;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde_json::json;
+use tokio::sync::watch;
 
 use config::Settings;
+use live::Feed;
 use upstream::TjClient;
 
 /// State shared by every handler.
 #[derive(Clone)]
 struct AppState {
     client: Arc<TjClient>,
+    feed: Feed,
 }
 
 /// Builds the router with every route. Tests call this directly, without a socket.
@@ -20,6 +24,7 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(hello))
         .route("/health", get(health))
+        .route("/ws", get(live::ws))
         .with_state(state)
 }
 
@@ -31,15 +36,20 @@ async fn hello() -> &'static str {
 /// Reports the upstream login state. It gets or renews the guest token first,
 /// so a 503 here means the upstream could not be reached.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let (code, status) = match state.client.ensure_token().await {
+    let (code, status) = match state.client.ensure_token(false).await {
         Ok(_) => (StatusCode::OK, "ok"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "degraded"),
     };
     let auth = state.client.token_info().await;
-    (code, Json(json!({ "status": status, "auth": auth })))
+    let buses = state.feed.borrow().as_ref().map_or(0, |b| b.len());
+    let live = json!({ "buses": buses, "ws_clients": state.feed.receiver_count() });
+    (
+        code,
+        Json(json!({ "status": status, "auth": auth, "live": live })),
+    )
 }
 
-/// Loads .env and settings, then starts the HTTP server on port 8000.
+/// Loads .env and settings, starts the bus poller, then serves HTTP on port 8000.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The .env file is optional, but a broken one should stop the server.
@@ -49,9 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
     tracing_subscriber::fmt::init();
+    let settings = Settings::from_env()?;
+    let poll = settings.poll;
     let state = AppState {
-        client: Arc::new(TjClient::new(Settings::from_env()?)?),
+        client: Arc::new(TjClient::new(settings)?),
+        feed: Arc::new(watch::Sender::new(None)),
     };
+    tokio::spawn(live::poller(state.client.clone(), state.feed.clone(), poll));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
     axum::serve(listener, app(state)).await?;
     Ok(())
@@ -70,6 +84,7 @@ mod tests {
         let client = TjClient::new(Settings::new(start(fake).await)).unwrap();
         app(AppState {
             client: Arc::new(client),
+            feed: Arc::new(watch::Sender::new(None)),
         })
     }
 
@@ -105,6 +120,7 @@ mod tests {
         assert_eq!(v["auth"]["has_token"], true);
         assert_eq!(v["auth"]["logged_in_as"], "guest");
         assert_eq!(v["auth"]["last_error"], Value::Null);
+        assert_eq!(v["live"], json!({"buses": 0, "ws_clients": 0}));
     }
 
     /// GET /health answers 503 with the last error when every login attempt fails.

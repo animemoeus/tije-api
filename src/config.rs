@@ -8,6 +8,8 @@ use std::time::Duration;
 pub struct Settings {
     pub base_url: String,
     pub timeout: Duration,
+    /// How often the bus feed polls the upstream while a client is listening.
+    pub poll: Duration,
     pub app_version: String,
     pub app_os: String,
     pub app_os_version: String,
@@ -24,6 +26,7 @@ impl Settings {
         Self {
             base_url: base_url.into(),
             timeout: Duration::from_secs(15),
+            poll: Duration::from_millis(500),
             app_version: "3.0.4".into(),
             app_os: "android".into(),
             app_os_version: "14".into(),
@@ -43,12 +46,18 @@ impl Settings {
 
         let mut s = Self::new(base_url);
 
-        if let Some(v) = env("TIMEOUT_SECONDS") {
-            s.timeout = v
-                .parse()
-                .ok()
-                .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-                .ok_or("TJ_TIMEOUT_SECONDS must be a positive number")?;
+        for (key, field) in [
+            ("TIMEOUT_SECONDS", &mut s.timeout),
+            ("POLL_SECONDS", &mut s.poll),
+        ] {
+            if let Some(v) = env(key) {
+                *field = v
+                    .parse()
+                    .ok()
+                    .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+                    .filter(|d| !d.is_zero())
+                    .ok_or(format!("TJ_{key} must be a positive number"))?;
+            }
         }
 
         for (key, field) in [

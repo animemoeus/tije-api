@@ -4,7 +4,7 @@ Rust port of the TJ Live Tracking API, built on axum. It logs in to the TransJak
 
 ## Working rules
 
-- Use the `ponytail` skill for all coding work. Write the smallest change that works, reach for std and existing crates before adding new ones, and skip abstractions nobody asked for.
+- Use the `ponytail` skill for all coding work. Write the smallest change that works, reach for std and existing crates before adding new ones, and skip abstractions nobody asked for. Where ponytail would leave a `ponytail:` comment on a deliberate shortcut, write `TODO:` instead.
 - Every change ships with a test that covers it, and `cargo test` must pass before the work counts as done. This applies to small changes too, which overrides ponytail's "trivial code needs no test".
 - Every function, test functions included, starts with a `///` doc comment saying what it does. Logic that takes more than a quick read to follow (math, state machines, concurrency, upstream quirks) also gets a `//` comment explaining why it works that way. Write comments as plain sentences with no backticks or other markdown, and run them through the humanizer like any other prose.
 - Follow idiomatic Rust and axum conventions. Ponytail decides how much code to write, and these conventions decide how it looks:

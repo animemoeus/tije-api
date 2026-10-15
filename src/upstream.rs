@@ -1,4 +1,4 @@
-//! Client for the TransJakarta app backend. For now it only manages the guest session tokens.
+//! Client for the TransJakarta app backend: guest session tokens and the bus position feed.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ use crate::config::Settings;
 const TOKEN_MARGIN: f64 = 300.0;
 /// Skip a refresh token that expires within this many seconds.
 const REFRESH_MARGIN: f64 = 60.0;
-// ponytail: fixed 3 rounds with a linear backoff; turn these into settings if upstream outages need longer retries.
+// TODO: fixed 3 rounds with a linear backoff; turn these into settings if upstream outages need longer retries.
 /// How many rounds of refresh and guest login to try before giving up.
 const MAX_ATTEMPTS: u32 = 3;
 /// Wait this long times the attempt number between rounds.
@@ -23,12 +23,25 @@ const RETRY_STEP: Duration = Duration::from_millis(200);
 
 /// A failed call to the upstream. The message names the method and path, never the full URL.
 #[derive(Debug)]
-pub struct UpstreamError(String);
+pub struct UpstreamError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl UpstreamError {
+    /// Builds an error that has no HTTP status, such as a network failure.
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+}
 
 impl fmt::Display for UpstreamError {
     /// Prints the message.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -66,7 +79,7 @@ impl Tokens {
             .get("token")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| UpstreamError("auth response has no token".into()))?;
+            .ok_or_else(|| UpstreamError::new("auth response has no token"))?;
         self.token = token.to_owned();
         self.valid_until = d
             .get("token_valid_until")
@@ -129,10 +142,11 @@ impl TjClient {
     ///
     /// A missing or expiring token is renewed: the refresh token first, then a new
     /// guest session if the refresh fails. Up to MAX_ATTEMPTS rounds run before the
-    /// last error is returned.
-    pub async fn ensure_token(&self) -> Result<String, UpstreamError> {
+    /// last error is returned. With force set, the current token is renewed even if
+    /// it looks valid, which is what a 401 from the upstream calls for.
+    pub async fn ensure_token(&self, force: bool) -> Result<String, UpstreamError> {
         let mut t = self.tokens.lock().await;
-        if !t.token.is_empty() && now() < t.valid_until - TOKEN_MARGIN {
+        if !force && !t.token.is_empty() && now() < t.valid_until - TOKEN_MARGIN {
             return Ok(t.token.clone());
         }
         let mut attempt = 1;
@@ -156,6 +170,36 @@ impl TjClient {
         }
     }
 
+    /// Fetches every bus within radius_km of a point from POST /v1/bus/offline.
+    /// A 401 gets one retry with a fresh token, in case the upstream revoked the old one early.
+    pub async fn offline_buses(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_km: f64,
+    ) -> Result<Vec<Value>, UpstreamError> {
+        const PATH: &str = "/v1/bus/offline";
+        let body = json!({
+            "latitude": lat,
+            "longitude": lon,
+            "radius": radius_km,
+            "event": "change_loc",
+        });
+        let token = self.ensure_token(false).await?;
+        let mut resp = match self.post(PATH, body.clone(), Some(&token)).await {
+            Err(e) if e.status == Some(401) => {
+                warn!("{e}; renewing the token and retrying once");
+                let token = self.ensure_token(true).await?;
+                self.post(PATH, body, Some(&token)).await?
+            }
+            other => other?,
+        };
+        Ok(match resp.get_mut("data").map(Value::take) {
+            Some(Value::Array(buses)) => buses,
+            _ => Vec::new(),
+        })
+    }
+
     /// Reports the login state without exposing any token.
     pub async fn token_info(&self) -> TokenInfo {
         let t = self.tokens.lock().await;
@@ -174,7 +218,7 @@ impl TjClient {
     async fn renew(&self, t: &mut Tokens) -> Result<(), UpstreamError> {
         if !t.refresh.is_empty() && now() < t.refresh_valid_until - REFRESH_MARGIN {
             let body = json!({ "refresh_token": t.refresh });
-            match self.post("/v1/auth/token/refresh", body).await {
+            match self.post("/v1/auth/token/refresh", body, None).await {
                 Ok(b) if t.store(&b).is_ok() => {
                     info!("upstream token refreshed");
                     return Ok(());
@@ -183,7 +227,7 @@ impl TjClient {
                 Err(e) => warn!("token refresh failed ({e}); starting a guest session"),
             }
         }
-        let body = self.post("/v1/auth/login/guest", json!({})).await?;
+        let body = self.post("/v1/auth/login/guest", json!({}), None).await?;
         t.store(&body)?;
         t.logged_in_as = Some("guest");
         info!(
@@ -193,15 +237,24 @@ impl TjClient {
         Ok(())
     }
 
-    /// Sends a JSON POST without a token. Network failures, HTTP errors and
-    /// non-JSON bodies all become an UpstreamError.
-    async fn post(&self, path: &str, body: Value) -> Result<Value, UpstreamError> {
-        let err = |detail: String| UpstreamError(format!("POST {path}: {detail}"));
-        // without_url keeps the upstream host out of error messages and logs.
-        let resp = self
+    /// Sends a JSON POST, with a bearer token when one is given. Network failures,
+    /// HTTP errors and non-JSON bodies all become an UpstreamError.
+    async fn post(
+        &self,
+        path: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> Result<Value, UpstreamError> {
+        let err = |detail: String| UpstreamError::new(format!("POST {path}: {detail}"));
+        let mut req = self
             .http
             .post(format!("{}{path}", self.base_url))
-            .json(&body)
+            .json(&body);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        // without_url keeps the upstream host out of error messages and logs.
+        let resp = req
             .send()
             .await
             .map_err(|e| err(e.without_url().to_string()))?;
@@ -212,7 +265,10 @@ impl TjClient {
             .map_err(|e| err(e.without_url().to_string()))?;
         if status.is_client_error() || status.is_server_error() {
             let snippet: String = text.chars().take(200).collect();
-            return Err(err(format!("HTTP {} {snippet}", status.as_u16())));
+            return Err(UpstreamError {
+                status: Some(status.as_u16()),
+                ..err(format!("HTTP {} {snippet}", status.as_u16()))
+            });
         }
         serde_json::from_str(&text).map_err(|_| err("response is not JSON".into()))
     }
@@ -248,6 +304,10 @@ pub mod fake {
         pub fail_logins: u32,
         /// Answer every refresh with HTTP 401.
         pub fail_refresh: bool,
+        /// Answer the next bus poll with HTTP 401, as if the token was revoked.
+        pub revoke_token: bool,
+        /// What POST /v1/bus/offline returns in data.
+        pub buses: Vec<Value>,
         issued: u32,
     }
 
@@ -260,8 +320,15 @@ pub mod fake {
             ttl: 86400.0,
             fail_logins: 0,
             fail_refresh: false,
+            revoke_token: false,
+            buses: Vec::new(),
             issued: 0,
         }))
+    }
+
+    /// Counts the requests made to one path.
+    pub fn count(fake: &Fake, path: &str) -> usize {
+        paths(fake).iter().filter(|p| *p == path).count()
     }
 
     /// Lists the paths requested so far.
@@ -285,7 +352,8 @@ pub mod fake {
         url
     }
 
-    /// Records the request, then answers login and refresh with numbered tokens (tok1, ref1, ...).
+    /// Records the request, then answers login and refresh with numbered tokens
+    /// (tok1, ref1, ...) and bus polls with the configured buses.
     async fn handle(
         State(fake): State<Fake>,
         uri: Uri,
@@ -319,6 +387,14 @@ pub mod fake {
                     })),
                 )
             }
+            "/v1/bus/offline" if s.revoke_token => {
+                s.revoke_token = false;
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"message": "Unauthorized, token is required"})),
+                )
+            }
+            "/v1/bus/offline" => (StatusCode::OK, Json(json!({"data": s.buses}))),
             _ => (StatusCode::NOT_FOUND, Json(json!({}))),
         }
     }
@@ -360,8 +436,8 @@ mod tests {
     async fn guest_login_then_reuse() {
         let f = fake();
         let c = client(&f).await;
-        assert_eq!(c.ensure_token().await.unwrap(), "tok1");
-        assert_eq!(c.ensure_token().await.unwrap(), "tok1");
+        assert_eq!(c.ensure_token(false).await.unwrap(), "tok1");
+        assert_eq!(c.ensure_token(false).await.unwrap(), "tok1");
         assert_eq!(paths(&f), ["/v1/auth/login/guest"]);
     }
 
@@ -369,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn guest_login_sends_device_headers() {
         let f = fake();
-        client(&f).await.ensure_token().await.unwrap();
+        client(&f).await.ensure_token(false).await.unwrap();
         let s = f.lock().unwrap();
         let (_, body, headers) = &s.calls[0];
         assert_eq!(body, &json!({}));
@@ -385,8 +461,8 @@ mod tests {
         let f = fake();
         f.lock().unwrap().ttl = 10.0;
         let c = client(&f).await;
-        c.ensure_token().await.unwrap();
-        assert_eq!(c.ensure_token().await.unwrap(), "tok2");
+        c.ensure_token(false).await.unwrap();
+        assert_eq!(c.ensure_token(false).await.unwrap(), "tok2");
         assert_eq!(
             paths(&f),
             ["/v1/auth/login/guest", "/v1/auth/token/refresh"]
@@ -407,8 +483,8 @@ mod tests {
             s.fail_refresh = true;
         }
         let c = client(&f).await;
-        c.ensure_token().await.unwrap();
-        assert_eq!(c.ensure_token().await.unwrap(), "tok2");
+        c.ensure_token(false).await.unwrap();
+        assert_eq!(c.ensure_token(false).await.unwrap(), "tok2");
         assert_eq!(
             paths(&f),
             [
@@ -425,9 +501,47 @@ mod tests {
         let f = fake();
         f.lock().unwrap().fail_logins = 1;
         let c = client(&f).await;
-        assert_eq!(c.ensure_token().await.unwrap(), "tok1");
+        assert_eq!(c.ensure_token(false).await.unwrap(), "tok1");
         assert_eq!(paths(&f).len(), 2);
         assert!(c.token_info().await.last_error.is_none());
+    }
+
+    /// A bus poll sends the bearer token and the area payload, and returns data.
+    #[tokio::test]
+    async fn offline_buses_sends_token_and_area() {
+        let f = fake();
+        f.lock().unwrap().buses = vec![json!({"bus_body_no": "TJ-1"})];
+        let c = client(&f).await;
+        let buses = c.offline_buses(-6.1754, 106.8272, 60.0).await.unwrap();
+        assert_eq!(buses, [json!({"bus_body_no": "TJ-1"})]);
+        let s = f.lock().unwrap();
+        let (path, body, headers) = &s.calls[1];
+        assert_eq!(path, "/v1/bus/offline");
+        assert_eq!(headers["authorization"], "Bearer tok1");
+        assert_eq!(
+            body,
+            &json!({"latitude": -6.1754, "longitude": 106.8272, "radius": 60.0, "event": "change_loc"})
+        );
+    }
+
+    /// A 401 on a bus poll renews the token and retries once with the new one.
+    #[tokio::test]
+    async fn offline_buses_retries_once_after_401() {
+        let f = fake();
+        let c = client(&f).await;
+        c.ensure_token(false).await.unwrap();
+        f.lock().unwrap().revoke_token = true;
+        c.offline_buses(-6.1754, 106.8272, 1.0).await.unwrap();
+        assert_eq!(
+            paths(&f),
+            [
+                "/v1/auth/login/guest",
+                "/v1/bus/offline",
+                "/v1/auth/token/refresh",
+                "/v1/bus/offline"
+            ]
+        );
+        assert_eq!(f.lock().unwrap().calls[3].2["authorization"], "Bearer tok2");
     }
 
     /// After MAX_ATTEMPTS failed logins the error comes back and is kept in last_error.
@@ -436,7 +550,7 @@ mod tests {
         let f = fake();
         f.lock().unwrap().fail_logins = 99;
         let c = client(&f).await;
-        let e = c.ensure_token().await.unwrap_err();
+        let e = c.ensure_token(false).await.unwrap_err();
         assert!(
             e.to_string()
                 .starts_with("POST /v1/auth/login/guest: HTTP 500")
