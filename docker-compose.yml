@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    image: tije-api:latest
+    container_name: tije-api
+    ports:
+      - "100.73.60.108:59101:8000"
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped

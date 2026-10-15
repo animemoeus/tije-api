@@ -47,6 +47,18 @@ curl http://localhost:8000/health
 
 `live.clients` counts every open `/ws` connection and `/buses/{bus_body_no}` stream.
 
+## Docker
+
+The image builds the release binary and runs it on distroless as a non-root user. `.dockerignore` keeps `.env` out of the image, and compose passes it to the container at runtime.
+
+```sh
+cp .env.example .env   # set TJ_BASE_URL
+docker compose up -d --build
+curl http://localhost:8000/health
+```
+
+Compose publishes port 8000 on every host interface. To bind a single address, change `ports` in `docker-compose.yml`. If `TJ_BASE_URL` is missing, the container exits right away with an error that says so.
+
 ## Endpoints
 
 | Method | Path | Description |
