@@ -1,6 +1,6 @@
 # tije-api
 
-Rust port of the TJ Live Tracking API, built on axum. It logs in to the TransJakarta app backend (`tijeapi.transjakarta.co.id`), polls bus positions, and serves them to other clients over HTTP and WebSocket.
+Rust port of the TJ Live Tracking API, built on axum. It logs in to the TransJakarta app backend (host set by `TJ_BASE_URL`), polls bus positions, and serves them to other clients over HTTP and WebSocket.
 
 ## Working rules
 
@@ -51,4 +51,5 @@ git config core.hooksPath .githooks   # once per clone: pre-commit hook formats 
 - Test endpoints in-process: build the router with `app()` and call it with `tower::ServiceExt::oneshot`, no open port needed.
 - Tests never call the real upstream. Start a small axum router on `127.0.0.1:0` as a fake upstream and point `TJ_BASE_URL` at it, the same way the Python tests use `httpx.MockTransport`. Tests must ignore `.env`.
 - Never log or return tokens and passwords. Account endpoints are read-only; don't expose anything that edits a profile or makes a payment.
+- Keep the upstream host out of the repo: code, docs, tests and logs. It only lives in `.env` as `TJ_BASE_URL`. Error messages name the method and path, never the full URL.
 - The upstream is not a public API. Clients watching the same area share one poll, so don't add per-client upstream requests.
