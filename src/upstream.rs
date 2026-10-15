@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -29,6 +30,11 @@ pub struct UpstreamError {
 }
 
 impl UpstreamError {
+    /// HTTP status the upstream answered with, if it answered at all.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
     /// Builds an error that has no HTTP status, such as a network failure.
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -185,19 +191,43 @@ impl TjClient {
             "radius": radius_km,
             "event": "change_loc",
         });
+        let resp = self.authed(Method::POST, PATH, Some(body)).await?;
+        Ok(array(data(resp)))
+    }
+
+    /// Lists every route from GET /v2/route, without geometry. route_desc holds the route type.
+    pub async fn list_routes(&self) -> Result<Vec<Value>, UpstreamError> {
+        let resp = self.authed(Method::GET, "/v2/route", None).await?;
+        Ok(array(data(resp)["routes"].take()))
+    }
+
+    /// Fetches one route's stops and polylines from GET /v2/route/{code}. An unknown
+    /// code comes back as an error with status 404.
+    pub async fn get_route(&self, code: &str) -> Result<Value, UpstreamError> {
+        let path = format!("/v2/route/{}", percent_encode(code));
+        Ok(data(self.authed(Method::GET, &path, None).await?))
+    }
+
+    /// Sends a request with the bearer token. A 401 gets one retry with a fresh token,
+    /// in case the upstream revoked the old one early.
+    async fn authed(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, UpstreamError> {
         let token = self.ensure_token(false).await?;
-        let mut resp = match self.post(PATH, body.clone(), Some(&token)).await {
+        match self
+            .send(method.clone(), path, body.clone(), Some(&token))
+            .await
+        {
             Err(e) if e.status == Some(401) => {
                 warn!("{e}; renewing the token and retrying once");
                 let token = self.ensure_token(true).await?;
-                self.post(PATH, body, Some(&token)).await?
+                self.send(method, path, body, Some(&token)).await
             }
-            other => other?,
-        };
-        Ok(match resp.get_mut("data").map(Value::take) {
-            Some(Value::Array(buses)) => buses,
-            _ => Vec::new(),
-        })
+            other => other,
+        }
     }
 
     /// Reports the login state without exposing any token.
@@ -218,7 +248,10 @@ impl TjClient {
     async fn renew(&self, t: &mut Tokens) -> Result<(), UpstreamError> {
         if !t.refresh.is_empty() && now() < t.refresh_valid_until - REFRESH_MARGIN {
             let body = json!({ "refresh_token": t.refresh });
-            match self.post("/v1/auth/token/refresh", body, None).await {
+            match self
+                .send(Method::POST, "/v1/auth/token/refresh", Some(body), None)
+                .await
+            {
                 Ok(b) if t.store(&b).is_ok() => {
                     info!("upstream token refreshed");
                     return Ok(());
@@ -227,7 +260,9 @@ impl TjClient {
                 Err(e) => warn!("token refresh failed ({e}); starting a guest session"),
             }
         }
-        let body = self.post("/v1/auth/login/guest", json!({}), None).await?;
+        let body = self
+            .send(Method::POST, "/v1/auth/login/guest", Some(json!({})), None)
+            .await?;
         t.store(&body)?;
         t.logged_in_as = Some("guest");
         info!(
@@ -237,19 +272,22 @@ impl TjClient {
         Ok(())
     }
 
-    /// Sends a JSON POST, with a bearer token when one is given. Network failures,
+    /// Sends a request with an optional JSON body and bearer token. Network failures,
     /// HTTP errors and non-JSON bodies all become an UpstreamError.
-    async fn post(
+    async fn send(
         &self,
+        method: Method,
         path: &str,
-        body: Value,
+        body: Option<Value>,
         token: Option<&str>,
     ) -> Result<Value, UpstreamError> {
-        let err = |detail: String| UpstreamError::new(format!("POST {path}: {detail}"));
+        let err = |detail: String| UpstreamError::new(format!("{method} {path}: {detail}"));
         let mut req = self
             .http
-            .post(format!("{}{path}", self.base_url))
-            .json(&body);
+            .request(method.clone(), format!("{}{path}", self.base_url));
+        if let Some(body) = &body {
+            req = req.json(body);
+        }
         if let Some(token) = token {
             req = req.bearer_auth(token);
         }
@@ -274,6 +312,33 @@ impl TjClient {
     }
 }
 
+/// Takes the data field out of an upstream response, or Null when there is none.
+fn data(mut resp: Value) -> Value {
+    resp["data"].take()
+}
+
+/// Turns a JSON array into a Vec. Anything else becomes an empty Vec.
+fn array(v: Value) -> Vec<Value> {
+    match v {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    }
+}
+
+/// Percent-encodes everything except unreserved URL characters, so a route code
+/// stays one path segment.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 /// Current unix time in seconds.
 fn now() -> f64 {
     SystemTime::now()
@@ -284,19 +349,21 @@ fn now() -> f64 {
 /// Fake upstream for tests: an axum server on a random local port.
 #[cfg(test)]
 pub mod fake {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use axum::{
         Json, Router,
+        body::Bytes,
         extract::State,
         http::{HeaderMap, StatusCode, Uri},
-        routing::post,
+        routing::any,
     };
     use serde_json::{Value, json};
 
     /// What the fake has seen, and knobs that make it misbehave.
     pub struct FakeState {
-        /// Path, JSON body and headers of every request, in order.
+        /// Path, JSON body (Null for none) and headers of every request, in order.
         pub calls: Vec<(String, Value, HeaderMap)>,
         /// Lifetime in seconds of the access tokens it hands out.
         pub ttl: f64,
@@ -304,10 +371,14 @@ pub mod fake {
         pub fail_logins: u32,
         /// Answer every refresh with HTTP 401.
         pub fail_refresh: bool,
-        /// Answer the next bus poll with HTTP 401, as if the token was revoked.
+        /// Answer the next authenticated request with HTTP 401, as if the token was revoked.
         pub revoke_token: bool,
         /// What POST /v1/bus/offline returns in data.
         pub buses: Vec<Value>,
+        /// What GET /v2/route returns in data.routes.
+        pub routes: Vec<Value>,
+        /// What GET /v2/route/{code} returns in data, by code. Unknown codes get HTTP 404.
+        pub route_details: HashMap<String, Value>,
         issued: u32,
     }
 
@@ -322,13 +393,10 @@ pub mod fake {
             fail_refresh: false,
             revoke_token: false,
             buses: Vec::new(),
+            routes: Vec::new(),
+            route_details: HashMap::new(),
             issued: 0,
         }))
-    }
-
-    /// Counts the requests made to one path.
-    pub fn count(fake: &Fake, path: &str) -> usize {
-        paths(fake).iter().filter(|p| *p == path).count()
     }
 
     /// Lists the paths requested so far.
@@ -341,10 +409,15 @@ pub mod fake {
             .collect()
     }
 
+    /// Counts the requests made to one path.
+    pub fn count(fake: &Fake, path: &str) -> usize {
+        paths(fake).iter().filter(|p| *p == path).count()
+    }
+
     /// Starts the fake and returns its base URL.
     pub async fn start(fake: &Fake) -> String {
         let app = Router::new()
-            .route("/{*path}", post(handle))
+            .route("/{*path}", any(handle))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -352,17 +425,28 @@ pub mod fake {
         url
     }
 
-    /// Records the request, then answers login and refresh with numbered tokens
-    /// (tok1, ref1, ...) and bus polls with the configured buses.
+    /// Records the request, then answers like the upstream: numbered tokens
+    /// (tok1, ref1, ...) for login and refresh, and the configured buses and routes.
     async fn handle(
         State(fake): State<Fake>,
         uri: Uri,
         headers: HeaderMap,
-        Json(body): Json<Value>,
+        body: Bytes,
     ) -> (StatusCode, Json<Value>) {
         let mut s = fake.lock().unwrap();
-        s.calls.push((uri.path().to_owned(), body, headers));
-        match uri.path() {
+        let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let path = uri.path().to_owned();
+        let authed = headers.contains_key("authorization");
+        s.calls.push((path.clone(), body, headers));
+        if authed && s.revoke_token {
+            s.revoke_token = false;
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "Unauthorized, token is required"})),
+            );
+        }
+        let ok = |data: Value| (StatusCode::OK, Json(json!({ "data": data })));
+        match path.as_str() {
             "/v1/auth/login/guest" if s.fail_logins > 0 => {
                 s.fail_logins -= 1;
                 (
@@ -387,15 +471,15 @@ pub mod fake {
                     })),
                 )
             }
-            "/v1/bus/offline" if s.revoke_token => {
-                s.revoke_token = false;
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"message": "Unauthorized, token is required"})),
-                )
-            }
-            "/v1/bus/offline" => (StatusCode::OK, Json(json!({"data": s.buses}))),
-            _ => (StatusCode::NOT_FOUND, Json(json!({}))),
+            "/v1/bus/offline" => ok(json!(s.buses)),
+            "/v2/route" => ok(json!({ "routes": s.routes })),
+            p => match p
+                .strip_prefix("/v2/route/")
+                .and_then(|code| s.route_details.get(code))
+            {
+                Some(detail) => ok(detail.clone()),
+                None => (StatusCode::NOT_FOUND, Json(json!({"message": "not found"}))),
+            },
         }
     }
 }
@@ -542,6 +626,36 @@ mod tests {
             ]
         );
         assert_eq!(f.lock().unwrap().calls[3].2["authorization"], "Bearer tok2");
+    }
+
+    /// Route calls are GETs with the bearer token. The route code is encoded as one
+    /// path segment, and an unknown route keeps its 404 status.
+    #[tokio::test]
+    async fn route_calls() {
+        let f = fake();
+        {
+            let mut s = f.lock().unwrap();
+            s.routes = vec![json!({"route_short_name": "1"})];
+            s.route_details.insert(
+                "JAK.10".into(),
+                json!({"route": {"route_short_name": "JAK.10"}}),
+            );
+        }
+        let c = client(&f).await;
+        assert_eq!(
+            c.list_routes().await.unwrap(),
+            [json!({"route_short_name": "1"})]
+        );
+        assert_eq!(
+            c.get_route("JAK.10").await.unwrap()["route"]["route_short_name"],
+            "JAK.10"
+        );
+        assert_eq!(c.get_route("9 X/Y").await.unwrap_err().status(), Some(404));
+        let s = f.lock().unwrap();
+        assert_eq!(s.calls[1].0, "/v2/route");
+        assert_eq!(s.calls[1].1, Value::Null);
+        assert_eq!(s.calls[1].2["authorization"], "Bearer tok1");
+        assert_eq!(s.calls[3].0, "/v2/route/9%20X%2FY");
     }
 
     /// After MAX_ATTEMPTS failed logins the error comes back and is kept in last_error.

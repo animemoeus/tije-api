@@ -1,5 +1,6 @@
-//! Live bus feed. One poller fetches every bus from the upstream, and each
-//! WebSocket client gets a filtered snapshot followed by deltas.
+//! Live bus feed. One poller fetches every bus from the upstream. WebSocket clients
+//! get a snapshot of the routes they pick followed by deltas, and an event stream
+//! follows a single bus.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -7,12 +8,15 @@ use std::time::Duration;
 
 use axum::{
     extract::{
-        Query, State, WebSocketUpgrade,
+        Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
+use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
@@ -22,15 +26,13 @@ use tracing::warn;
 use crate::AppState;
 use crate::upstream::TjClient;
 
-// TODO: one fixed area around Monas covers the network today (Bogor, the farthest
-// terminal, is 47.5 km out). Make these TJ_ settings if the network grows past it.
+// TODO: one fixed area around Monas covers the network today (the farthest bus,
+// near Bogor, is 47.7 km out). Make these TJ_ settings if the network grows past it.
 /// Center of the area the poller fetches.
 const LAT: f64 = -6.1754;
 const LON: f64 = 106.8272;
-/// Radius of the area the poller fetches, and the largest radius a client may ask for.
+/// Radius of the area the poller fetches.
 const RADIUS_KM: f64 = 60.0;
-/// Radius used when a client gives lat and lon without radius_km.
-const DEFAULT_RADIUS_KM: f64 = 1.0;
 
 /// Latest buses from the upstream, keyed by bus_body_no. A BTreeMap keeps snapshots in a stable order.
 pub type Buses = BTreeMap<String, Value>;
@@ -43,7 +45,7 @@ pub type Feed = Arc<watch::Sender<Option<Arc<Buses>>>>;
 pub async fn poller(client: Arc<TjClient>, feed: Feed, every: Duration) {
     let mut tick = tokio::time::interval(every);
     // A slow poll makes the next ticks late. Skip them instead of firing them back to back,
-    // so the upstream never gets more than one request per interval.
+    // so the upstream never gets more than one request at a time.
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
@@ -54,7 +56,7 @@ pub async fn poller(client: Arc<TjClient>, feed: Feed, every: Duration) {
             Ok(items) => {
                 let buses: Buses = items
                     .into_iter()
-                    .filter_map(|bus| Some((body_no(&bus)?, bus)))
+                    .filter_map(|bus| Some((body_no(&bus)?, enrich(bus))))
                     .collect();
                 feed.send_if_modified(|current| {
                     if current.as_deref() == Some(&buses) {
@@ -69,96 +71,119 @@ pub async fn poller(client: Arc<TjClient>, feed: Feed, every: Duration) {
     }
 }
 
-/// Query parameters of WS /ws. All of them are optional.
+/// Adds the fields the frontend reads, the same ones the Python API derives, and
+/// keeps every upstream field as it is.
+///
+/// raw_latitude and raw_longitude hold the reported position, latitude and longitude
+/// the route-snapped one when the upstream has it. type becomes BRT, Mikrotrans or
+/// Non-BRT, and next_stop_name and prev_stop_name drop the stop code prefix.
+fn enrich(mut bus: Value) -> Value {
+    let Some(fields) = bus.as_object_mut() else {
+        return bus;
+    };
+    let raw_lat = fields.get("latitude").cloned().unwrap_or(Value::Null);
+    let raw_lon = fields.get("longitude").cloned().unwrap_or(Value::Null);
+    let snapped = |snap: &str, raw: &Value| {
+        fields
+            .get(snap)
+            .and_then(coord)
+            .or_else(|| coord(raw))
+            .map_or(Value::Null, Value::from)
+    };
+    let (lat, lon) = (
+        snapped("snap_latitude", &raw_lat),
+        snapped("snap_longitude", &raw_lon),
+    );
+    let kind = bus_type(fields.get("type"));
+    let next = stop_name(fields.get("next_stops"));
+    let prev = stop_name(fields.get("prev_stops"));
+    fields.insert("raw_latitude".into(), raw_lat);
+    fields.insert("raw_longitude".into(), raw_lon);
+    fields.insert("latitude".into(), lat);
+    fields.insert("longitude".into(), lon);
+    fields.insert("type".into(), kind.into());
+    fields.insert("next_stop_name".into(), next.into());
+    fields.insert("prev_stop_name".into(), prev.into());
+    bus
+}
+
+/// Maps the upstream bus type to BRT, Mikrotrans or Non-BRT, ignoring case.
+fn bus_type(raw: Option<&Value>) -> &'static str {
+    match raw
+        .and_then(Value::as_str)
+        .map(str::to_uppercase)
+        .as_deref()
+    {
+        Some("BRT") => "BRT",
+        Some("MIKROTRANS") => "Mikrotrans",
+        _ => "Non-BRT",
+    }
+}
+
+/// Strips the stop code the upstream puts in front of halte names, so
+/// "H00251P-Tosari" becomes "Tosari". Only a prefix that starts with a letter
+/// followed by a digit counts as a code.
+fn stop_name(raw: Option<&Value>) -> Option<String> {
+    let s = match raw? {
+        Value::String(s) if !s.is_empty() => s.as_str(),
+        _ => return None,
+    };
+    let Some((code, name)) = s.split_once('-') else {
+        return Some(s.to_owned());
+    };
+    let mut chars = code.chars();
+    let is_code = chars.next().is_some_and(char::is_alphabetic)
+        && chars.next().is_some_and(|c| c.is_ascii_digit());
+    Some(if is_code { name } else { s }.to_owned())
+}
+
+/// Query parameters of WS /ws. Anything else in the query, such as the lat, lon,
+/// radius_km and mode the old frontend sends, is ignored.
 #[derive(Deserialize)]
 pub struct WsParams {
-    lat: Option<f64>,
-    lon: Option<f64>,
-    radius_km: Option<f64>,
+    /// Comma-separated route codes. Empty or missing means every route.
     routes: Option<String>,
 }
 
-/// Which buses a client wants.
-#[derive(Debug, PartialEq)]
-struct Filter {
-    /// Center and radius in km.
-    area: Option<(f64, f64, f64)>,
-    /// Upper-case route codes.
-    routes: Option<HashSet<String>>,
+/// Upper-case route codes a client wants, or None for every route.
+type Routes = Option<HashSet<String>>;
+
+/// Parses the routes parameter. Codes match without regard to case.
+fn parse_routes(raw: Option<&str>) -> Routes {
+    let codes: HashSet<String> = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(|c| c.trim().to_uppercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    (!codes.is_empty()).then_some(codes)
 }
 
-impl Filter {
-    /// Validates the query. lat and lon come as a pair and must lie around Jakarta,
-    /// using the same bounds as the Python API.
-    fn from_params(p: WsParams) -> Result<Self, String> {
-        let area = match (p.lat, p.lon) {
-            (Some(lat), Some(lon)) => {
-                if !(-7.5..=-5.5).contains(&lat) || !(106.0..=107.5).contains(&lon) {
-                    return Err("lat must be within -7.5..-5.5 and lon within 106.0..107.5".into());
-                }
-                let r = p.radius_km.unwrap_or(DEFAULT_RADIUS_KM);
-                if !(r > 0.0 && r <= RADIUS_KM) {
-                    return Err(format!("radius_km must be above 0 and at most {RADIUS_KM}"));
-                }
-                Some((lat, lon, r))
-            }
-            (None, None) if p.radius_km.is_none() => None,
-            _ => return Err("lat, lon and radius_km need both lat and lon".into()),
-        };
-        let routes: HashSet<String> = p
-            .routes
-            .unwrap_or_default()
-            .split(',')
-            .map(|c| c.trim().to_uppercase())
-            .filter(|c| !c.is_empty())
-            .collect();
-        Ok(Self {
-            area,
-            routes: (!routes.is_empty()).then_some(routes),
+/// Keeps the buses on the wanted routes.
+fn apply(routes: &Routes, all: &Buses) -> Buses {
+    all.iter()
+        .filter(|(_, bus)| {
+            routes.as_ref().is_none_or(|r| {
+                let code = match &bus["route_code"] {
+                    Value::String(s) => s.to_uppercase(),
+                    other => other.to_string(),
+                };
+                r.contains(&code)
+            })
         })
-    }
-
-    /// Tells whether a bus passes the route and area filters.
-    fn matches(&self, bus: &Value) -> bool {
-        if let Some(routes) = &self.routes {
-            let code = match &bus["route_code"] {
-                Value::String(s) => s.to_uppercase(),
-                other => other.to_string(),
-            };
-            if !routes.contains(&code) {
-                return false;
-            }
-        }
-        match self.area {
-            None => true,
-            Some((lat, lon, r)) => {
-                position(bus).is_some_and(|(blat, blon)| haversine_km(lat, lon, blat, blon) <= r)
-            }
-        }
-    }
-
-    /// Keeps the buses that pass the filter.
-    fn apply(&self, all: &Buses) -> Buses {
-        all.iter()
-            .filter(|(_, bus)| self.matches(bus))
-            .map(|(no, bus)| (no.clone(), bus.clone()))
-            .collect()
-    }
+        .map(|(no, bus)| (no.clone(), bus.clone()))
+        .collect()
 }
 
-/// Handles WS /ws. Bad parameters get a 400 before the upgrade.
+/// Handles WS /ws.
 pub async fn ws(
     State(state): State<AppState>,
     Query(params): Query<WsParams>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match Filter::from_params(params) {
-        Ok(filter) => {
-            let rx = state.feed.subscribe();
-            upgrade.on_upgrade(move |socket| stream(socket, rx, filter))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
-    }
+    let routes = parse_routes(params.routes.as_deref());
+    let rx = state.feed.subscribe();
+    upgrade.on_upgrade(move |socket| stream(socket, rx, routes))
 }
 
 /// Sends one client a snapshot of its buses, then a delta every time they change,
@@ -166,7 +191,7 @@ pub async fn ws(
 async fn stream(
     mut socket: WebSocket,
     mut rx: watch::Receiver<Option<Arc<Buses>>>,
-    filter: Filter,
+    routes: Routes,
 ) {
     // What this client has been sent so far. None until the snapshot goes out.
     let mut sent: Option<Buses> = None;
@@ -182,7 +207,7 @@ async fn stream(
                 let Some(all) = rx.borrow_and_update().clone() else {
                     continue;
                 };
-                let now = filter.apply(&all);
+                let now = apply(&routes, &all);
                 // The watch only keeps the latest value, so a slow client may miss
                 // updates in between. Diffing against what this client was actually
                 // sent keeps its view correct anyway.
@@ -206,6 +231,44 @@ async fn stream(
             }
         }
     }
+}
+
+/// Handles GET /buses/{bus_body_no} as a server-sent event stream.
+///
+/// A bus event carries the whole bus, first as soon as there is data and then each
+/// time the bus changes. A gone event says the bus is missing from the latest poll,
+/// and the stream ends after it. The stream listens to the shared feed, so it keeps
+/// the poller running and never calls the upstream itself.
+pub async fn bus_events(
+    State(state): State<AppState>,
+    Path(no): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let mut rx = state.feed.subscribe();
+    rx.mark_changed();
+    // The state is the receiver plus the last bus sent. None ends the stream.
+    let events = futures_util::stream::unfold(Some((rx, None::<Value>)), move |st| {
+        let no = no.clone();
+        async move {
+            let (mut rx, last) = st?;
+            loop {
+                rx.changed().await.ok()?;
+                let Some(all) = rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let Some(bus) = all.get(&no) else {
+                    let gone = Event::default()
+                        .event("gone")
+                        .json_data(json!({ "bus_body_no": no }));
+                    return Some((gone, None));
+                };
+                if last.as_ref() != Some(bus) {
+                    let event = Event::default().event("bus").json_data(bus);
+                    return Some((event, Some((rx, Some(bus.clone())))));
+                }
+            }
+        }
+    });
+    Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 // TODO: every client computes its own diff, O(buses) per update. Share it between
@@ -248,15 +311,6 @@ fn body_no(bus: &Value) -> Option<String> {
     }
 }
 
-/// Position of a bus. The route-snapped coordinates win when present, like in the app.
-fn position(bus: &Value) -> Option<(f64, f64)> {
-    let pick = |snap: &str, raw: &str| coord(&bus[snap]).or_else(|| coord(&bus[raw]));
-    Some((
-        pick("snap_latitude", "latitude")?,
-        pick("snap_longitude", "longitude")?,
-    ))
-}
-
 /// Reads a coordinate sent as a number or a numeric string. Zero counts as missing,
 /// as it does in the Python API.
 fn coord(v: &Value) -> Option<f64> {
@@ -266,14 +320,6 @@ fn coord(v: &Value) -> Option<f64> {
         _ => None,
     }?;
     (x != 0.0).then_some(x)
-}
-
-/// Great-circle distance in km, with an earth radius of 6371 km.
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let (dp, dl) = (p2 - p1, (lon2 - lon1).to_radians());
-    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
-    2.0 * 6371.0 * a.sqrt().asin()
 }
 
 #[cfg(test)]
@@ -302,25 +348,15 @@ mod tests {
             .collect()
     }
 
-    /// Parses a query string into a filter.
-    fn filter(query: &str) -> Result<Filter, String> {
-        let uri: axum::http::Uri = format!("/ws?{query}").parse().unwrap();
-        Filter::from_params(Query::try_from_uri(&uri).unwrap().0)
-    }
-
-    /// Runs the whole app against the fake on a local port and returns the ws URL.
+    /// Runs the whole app against the fake on a local port and returns its base address.
     async fn serve(fake: &Fake) -> (String, AppState) {
-        let client = Arc::new(TjClient::new(Settings::new(start(fake).await)).unwrap());
-        let state = AppState {
-            client: client.clone(),
-            feed: Arc::new(watch::Sender::new(None)),
-        };
-        tokio::spawn(poller(client, state.feed.clone(), TICK));
+        let state = AppState::new(TjClient::new(Settings::new(start(fake).await)).unwrap());
+        tokio::spawn(poller(state.client.clone(), state.feed.clone(), TICK));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap().to_string();
         let app = crate::app(state.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, state)
+        (addr, state)
     }
 
     /// Opens a WebSocket connection.
@@ -374,57 +410,67 @@ mod tests {
         assert_eq!(diff(&prev, &prev), None);
     }
 
-    /// The area filter uses the snapped position when there is one, and routes match in any case.
+    /// enrich derives the frontend fields and keeps the upstream ones.
     #[test]
-    fn filter_by_area_and_route() {
-        let near = bus("NEAR", -6.1760, 106.8280, "4d");
-        let mut snapped = bus("SNAP", -6.30, 106.90, "1");
-        snapped["snap_latitude"] = json!("-6.1755");
-        snapped["snap_longitude"] = json!(106.8273);
-        let far = bus("FAR", -6.30, 106.90, "4D");
-        let all = buses(&[near, snapped, far]);
-        let keys = |f: Filter| f.apply(&all).into_keys().collect::<Vec<_>>();
+    fn enrich_adds_frontend_fields() {
+        let mut b = bus("A", -6.2, 106.8, "1");
+        b["type"] = json!("brt");
+        b["snap_latitude"] = json!("-6.21");
+        b["next_stops"] = json!("H00251P-Tosari");
+        b["prev_stops"] = json!("Bundaran HI-Astra");
+        let e = enrich(b);
+        assert_eq!(e["raw_latitude"], -6.2);
+        assert_eq!(e["latitude"], -6.21);
+        assert_eq!(e["raw_longitude"], 106.8);
+        assert_eq!(e["longitude"], 106.8);
+        assert_eq!(e["type"], "BRT");
+        assert_eq!(e["next_stop_name"], "Tosari");
+        assert_eq!(e["prev_stop_name"], "Bundaran HI-Astra");
+        assert_eq!(e["next_stops"], "H00251P-Tosari");
+        assert_eq!(e["speed"], 0);
 
-        assert_eq!(keys(filter("").unwrap()), ["FAR", "NEAR", "SNAP"]);
-        assert_eq!(
-            keys(filter("lat=-6.1754&lon=106.8272").unwrap()),
-            ["NEAR", "SNAP"]
-        );
-        assert_eq!(keys(filter("routes=4D,%20x").unwrap()), ["FAR", "NEAR"]);
-        assert_eq!(
-            keys(filter("lat=-6.1754&lon=106.8272&radius_km=1&routes=4d").unwrap()),
-            ["NEAR"]
-        );
+        let e = enrich(json!({"bus_body_no": "B", "type": "Mikrotrans"}));
+        assert_eq!(e["type"], "Mikrotrans");
+        assert_eq!(e["latitude"], Value::Null);
+        assert_eq!(e["next_stop_name"], Value::Null);
+        assert_eq!(enrich(json!({"type": "other"}))["type"], "Non-BRT");
     }
 
-    /// lat without lon, coordinates outside Jakarta and a radius above the poll radius are rejected.
+    /// routes takes many codes, trims them and matches without regard to case.
     #[test]
-    fn bad_params_are_rejected() {
-        assert!(filter("lat=-6.1").is_err());
-        assert!(filter("radius_km=2").is_err());
-        assert!(filter("lat=1&lon=106.8").is_err());
-        assert!(filter("lat=-6.1&lon=106.8&radius_km=61").is_err());
-        assert!(filter("lat=-6.1&lon=106.8&radius_km=0").is_err());
-        assert_eq!(
-            filter("lat=-6.1&lon=106.8").unwrap().area,
-            Some((-6.1, 106.8, DEFAULT_RADIUS_KM))
-        );
+    fn filter_by_routes() {
+        let all = buses(&[
+            bus("A", -6.1, 106.8, "4d"),
+            bus("B", -6.1, 106.8, "1"),
+            bus("C", -6.1, 106.8, "JAK.10"),
+        ]);
+        let keys = |raw: Option<&str>| {
+            apply(&parse_routes(raw), &all)
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(None), ["A", "B", "C"]);
+        assert_eq!(keys(Some(" ,")), ["A", "B", "C"]);
+        assert_eq!(keys(Some("4D, jak.10")), ["A", "C"]);
+        assert_eq!(keys(Some("9")), Vec::<String>::new());
     }
 
-    /// A client gets a filtered snapshot, then deltas with only the changes, and nothing when nothing changed.
+    /// A client gets a snapshot of its routes, then deltas with only the changes,
+    /// and nothing when nothing changed.
     #[tokio::test]
     async fn snapshot_then_deltas() {
         let f = fake();
         f.lock().unwrap().buses = vec![
             bus("A", -6.1760, 106.8280, "1"),
-            bus("FAR", -6.30, 106.90, "1"),
+            bus("B", -6.30, 106.90, "2"),
         ];
-        let (url, _) = serve(&f).await;
-        let mut ws = connect(&format!("{url}?lat=-6.1754&lon=106.8272&radius_km=1")).await;
+        let (addr, _) = serve(&f).await;
+        let mut ws = connect(&format!("ws://{addr}/ws?routes=1")).await;
 
         let snap = next(&mut ws).await;
         assert_eq!(snap["type"], "snapshot");
         assert_eq!(nos(&snap), ["A"]);
+        assert_eq!(snap["buses"][0]["raw_latitude"], -6.1760);
         silent(&mut ws).await;
 
         f.lock().unwrap().buses[0]["speed"] = json!(20);
@@ -433,8 +479,15 @@ mod tests {
             json!({"type": "delta", "upsert": [{"bus_body_no": "A", "speed": 20}], "remove": []})
         );
 
-        // Moving out of the radius counts as a removal.
-        f.lock().unwrap().buses[0]["latitude"] = json!(-6.30);
+        // A new position shows up in both the shown and the raw coordinates.
+        f.lock().unwrap().buses[0]["latitude"] = json!(-6.1770);
+        assert_eq!(
+            next(&mut ws).await,
+            json!({"type": "delta", "upsert": [{"bus_body_no": "A", "latitude": -6.1770, "raw_latitude": -6.1770}], "remove": []})
+        );
+
+        // A bus that leaves the upstream data is removed.
+        f.lock().unwrap().buses.remove(0);
         assert_eq!(
             next(&mut ws).await,
             json!({"type": "delta", "upsert": [], "remove": ["A"]})
@@ -449,6 +502,19 @@ mod tests {
         );
     }
 
+    /// The area parameters the old frontend sends are ignored instead of rejected.
+    #[tokio::test]
+    async fn old_area_params_are_ignored() {
+        let f = fake();
+        f.lock().unwrap().buses = vec![bus("FAR", -6.60, 106.80, "1")];
+        let (addr, _) = serve(&f).await;
+        let mut ws = connect(&format!(
+            "ws://{addr}/ws?lat=-6.1754&lon=106.8272&radius_km=1&mode=delta"
+        ))
+        .await;
+        assert_eq!(nos(&next(&mut ws).await), ["FAR"]);
+    }
+
     /// Two clients with different filters share one poller but get different buses.
     #[tokio::test]
     async fn clients_share_the_poll() {
@@ -457,9 +523,9 @@ mod tests {
             bus("A", -6.1760, 106.8280, "1"),
             bus("B", -6.30, 106.90, "2"),
         ];
-        let (url, state) = serve(&f).await;
-        let mut all = connect(&url).await;
-        let mut route2 = connect(&format!("{url}?routes=2")).await;
+        let (addr, state) = serve(&f).await;
+        let mut all = connect(&format!("ws://{addr}/ws")).await;
+        let mut route2 = connect(&format!("ws://{addr}/ws?routes=2")).await;
         assert_eq!(nos(&next(&mut all).await), ["A", "B"]);
         assert_eq!(nos(&next(&mut route2).await), ["B"]);
         assert_eq!(state.feed.receiver_count(), 2);
@@ -485,13 +551,93 @@ mod tests {
         assert!(f.lock().unwrap().calls.is_empty());
     }
 
-    /// Bad parameters get a 400 instead of a WebSocket.
-    #[tokio::test]
-    async fn bad_params_get_400() {
-        let (url, _) = serve(&fake()).await;
-        match connect_async(format!("{url}?lat=-6.1")).await {
-            Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 400),
-            other => panic!("expected HTTP 400, got {other:?}"),
+    /// Reads server-sent events from a response body, one (event, data) pair at a time.
+    struct Events {
+        body: reqwest::Response,
+        buf: String,
+    }
+
+    impl Events {
+        /// Opens GET /buses/{no} and checks the content type.
+        async fn open(addr: &str, no: &str) -> Self {
+            let body = reqwest::get(format!("http://{addr}/buses/{no}"))
+                .await
+                .unwrap();
+            assert_eq!(body.headers()["content-type"], "text/event-stream");
+            Self {
+                body,
+                buf: String::new(),
+            }
         }
+
+        /// Waits up to one second for the next event. None means the stream ended.
+        async fn next(&mut self) -> Option<(String, Value)> {
+            loop {
+                // Events end with a blank line. Keep-alive comments start with a colon.
+                if let Some(end) = self.buf.find("\n\n") {
+                    let block: String = self.buf.drain(..end + 2).collect();
+                    let field = |name: &str| {
+                        block
+                            .lines()
+                            .find_map(|l| l.strip_prefix(name))
+                            .map(str::to_owned)
+                    };
+                    if let (Some(event), Some(data)) = (field("event: "), field("data: ")) {
+                        return Some((event, serde_json::from_str(&data).unwrap()));
+                    }
+                    continue;
+                }
+                let chunk = tokio::time::timeout(Duration::from_secs(1), self.body.chunk())
+                    .await
+                    .expect("no event within a second")
+                    .unwrap()?;
+                self.buf.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        }
+    }
+
+    /// The bus stream sends the bus, then each change to it, ignores other buses,
+    /// and ends with gone once the bus disappears.
+    #[tokio::test]
+    async fn bus_events_follow_one_bus() {
+        let f = fake();
+        f.lock().unwrap().buses = vec![
+            bus("A", -6.1760, 106.8280, "1"),
+            bus("B", -6.30, 106.90, "2"),
+        ];
+        let (addr, _) = serve(&f).await;
+        // The stream alone keeps the poller running, with no WebSocket client.
+        let mut ev = Events::open(&addr, "A").await;
+
+        let (name, data) = ev.next().await.unwrap();
+        assert_eq!(name, "bus");
+        assert_eq!(data["bus_body_no"], "A");
+        assert_eq!(data["type"], "Non-BRT");
+        assert_eq!(data["raw_latitude"], -6.1760);
+
+        // A change to another bus sends nothing, a change to this one sends it again.
+        f.lock().unwrap().buses[1]["speed"] = json!(5);
+        tokio::time::sleep(TICK * 4).await;
+        f.lock().unwrap().buses[0]["speed"] = json!(30);
+        let (name, data) = ev.next().await.unwrap();
+        assert_eq!((name.as_str(), &data["speed"]), ("bus", &json!(30)));
+
+        f.lock().unwrap().buses.remove(0);
+        assert_eq!(
+            ev.next().await,
+            Some(("gone".into(), json!({"bus_body_no": "A"})))
+        );
+        assert_eq!(ev.next().await, None);
+    }
+
+    /// An unknown bus gets gone right after the first poll.
+    #[tokio::test]
+    async fn bus_events_unknown_bus() {
+        let f = fake();
+        f.lock().unwrap().buses = vec![bus("A", -6.1760, 106.8280, "1")];
+        let (addr, _) = serve(&f).await;
+        let mut ev = Events::open(&addr, "NOPE").await;
+        assert_eq!(ev.next().await.unwrap().0, "gone");
+        assert_eq!(ev.next().await, None);
     }
 }

@@ -29,11 +29,11 @@ Module mapping:
 |---|---|---|
 | `app/config.py` | `src/config.rs` | Settings from `TJ_*` env vars and `.env` |
 | `app/upstream.py` | `src/upstream.rs` | Upstream client: guest/account login, token refresh, retry once on 401 |
-| `app/tracker.py` | `src/tracker.rs` | Bus position cache, radius/route filter, glide interpolation |
-| `app/routes.py` | `src/routes.rs` | Polyline decoding, route normalization |
-| `app/main.py` | `src/main.rs` | Router, area polling, WebSocket broadcast, background tasks |
+| `app/tracker.py` + WebSocket parts of `app/main.py` | `src/live.rs` | One poller for every bus, derived bus fields, route filter, WS snapshot/delta, per-bus event stream. No glide interpolation |
+| `app/routes.py` + route endpoints of `app/main.py` | `src/routes.rs` | Polyline decoding, route normalization, route cache, `/route-types`, `/routes` |
+| `app/main.py` | `src/main.rs` | Router, `AppState`, `AppError`, `/health`, CORS |
 
-Dependencies go one way: `main` uses everything, `upstream` uses `config`. `tracker` knows nothing about HTTP or upstream, and `upstream` knows nothing about areas or the tracker.
+Dependencies go one way: `main` uses everything, `live` and `routes` use `upstream`, `upstream` uses `config`. `upstream` knows nothing about the feed or the route cache.
 
 ## Commands
 
