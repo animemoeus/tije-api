@@ -35,7 +35,8 @@ const LON: f64 = 106.8272;
 const RADIUS_KM: f64 = 60.0;
 
 /// Latest buses from the upstream, keyed by bus_body_no. A BTreeMap keeps snapshots in a stable order.
-pub type Buses = BTreeMap<String, Value>;
+/// Each bus sits behind an Arc, so clients share one copy and an unchanged bus keeps the same pointer.
+pub type Buses = BTreeMap<String, Arc<Value>>;
 
 /// The shared feed. It holds None until the first successful poll.
 pub type Feed = Arc<watch::Sender<Option<Arc<Buses>>>>;
@@ -54,21 +55,42 @@ pub async fn poller(client: Arc<TjClient>, feed: Feed, every: Duration) {
         }
         match client.offline_buses(LAT, LON, RADIUS_KM).await {
             Ok(items) => {
-                let buses: Buses = items
+                let fresh = items
                     .into_iter()
-                    .filter_map(|bus| Some((body_no(&bus)?, enrich(bus))))
-                    .collect();
-                feed.send_if_modified(|current| {
-                    if current.as_deref() == Some(&buses) {
-                        return false;
+                    .filter_map(|bus| Some((body_no(&bus)?, enrich(bus))));
+                feed.send_if_modified(|current| match merge(current.as_deref(), fresh) {
+                    Some(buses) => {
+                        *current = Some(Arc::new(buses));
+                        true
                     }
-                    *current = Some(Arc::new(buses));
-                    true
+                    None => false,
                 });
             }
             Err(e) => warn!("bus poll failed: {e}"),
         }
     }
+}
+
+/// Builds the next feed from a fresh poll, or returns None when nothing changed.
+/// A bus equal to its previous version keeps the old Arc, which lets diff skip it
+/// with a pointer check instead of comparing every field again for every client.
+fn merge(prev: Option<&Buses>, fresh: impl IntoIterator<Item = (String, Value)>) -> Option<Buses> {
+    let mut changed = false;
+    let next: Buses = fresh
+        .into_iter()
+        .map(|(no, bus)| {
+            let bus = match prev.and_then(|p| p.get(&no)) {
+                Some(old) if **old == bus => old.clone(),
+                _ => {
+                    changed = true;
+                    Arc::new(bus)
+                }
+            };
+            (no, bus)
+        })
+        .collect();
+    // A bus that left the feed creates no new Arc, so a shorter map is the only sign of it.
+    (changed || prev.is_none_or(|p| p.len() != next.len())).then_some(next)
 }
 
 /// Adds the fields the frontend reads, the same ones the Python API derives, and
@@ -212,7 +234,7 @@ async fn stream(
                 // updates in between. Diffing against what this client was actually
                 // sent keeps its view correct anyway.
                 let msg = match &sent {
-                    None => json!({"type": "snapshot", "buses": now.values().collect::<Vec<_>>()})
+                    None => json!({"type": "snapshot", "buses": now.values().map(Arc::as_ref).collect::<Vec<_>>()})
                         .to_string(),
                     Some(prev) => match diff(prev, &now) {
                         Some(msg) => msg,
@@ -246,7 +268,7 @@ pub async fn bus_events(
     let mut rx = state.feed.subscribe();
     rx.mark_changed();
     // The state is the receiver plus the last bus sent. None ends the stream.
-    let events = futures_util::stream::unfold(Some((rx, None::<Value>)), move |st| {
+    let events = futures_util::stream::unfold(Some((rx, None::<Arc<Value>>)), move |st| {
         let no = no.clone();
         async move {
             let (mut rx, last) = st?;
@@ -262,7 +284,7 @@ pub async fn bus_events(
                     return Some((gone, None));
                 };
                 if last.as_ref() != Some(bus) {
-                    let event = Event::default().event("bus").json_data(bus);
+                    let event = Event::default().event("bus").json_data(bus.as_ref());
                     return Some((event, Some((rx, Some(bus.clone())))));
                 }
             }
@@ -271,17 +293,19 @@ pub async fn bus_events(
     Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-// TODO: every client computes its own diff, O(buses) per update. Share it between
-// clients with the same filter, like the Python API's groups, if CPU becomes a problem.
 /// Builds a delta message from prev to next, or None when nothing changed.
 /// New buses are sent whole, known ones only with bus_body_no and the fields that changed.
 fn diff(prev: &Buses, next: &Buses) -> Option<String> {
     let mut upsert = Vec::new();
     for (no, bus) in next {
         let Some(old) = prev.get(no) else {
-            upsert.push(bus.clone());
+            upsert.push(bus.as_ref().clone());
             continue;
         };
+        // merge keeps the Arc of an unchanged bus, so the same pointer means the same data.
+        if Arc::ptr_eq(old, bus) {
+            continue;
+        }
         let (Some(new_fields), Some(old_fields)) = (bus.as_object(), old.as_object()) else {
             continue;
         };
@@ -344,7 +368,7 @@ mod tests {
     fn buses(items: &[Value]) -> Buses {
         items
             .iter()
-            .map(|b| (body_no(b).unwrap(), b.clone()))
+            .map(|b| (body_no(b).unwrap(), Arc::new(b.clone())))
             .collect()
     }
 
@@ -408,6 +432,33 @@ mod tests {
         );
         assert_eq!(msg["remove"], json!(["B"]));
         assert_eq!(diff(&prev, &prev), None);
+    }
+
+    /// merge keeps the Arc of an unchanged bus, gives a changed one a new Arc, and
+    /// reports a removed bus or a repeat poll correctly.
+    #[test]
+    fn merge_reuses_unchanged_buses() {
+        let a = bus("A", -6.1, 106.8, "1");
+        let b = bus("B", -6.2, 106.8, "1");
+        let pairs = |items: &[&Value]| {
+            items
+                .iter()
+                .map(|v| (body_no(v).unwrap(), (*v).clone()))
+                .collect::<Vec<_>>()
+        };
+        let first = merge(None, pairs(&[&a, &b])).unwrap();
+        assert_eq!(merge(Some(&first), pairs(&[&a, &b])), None);
+
+        let mut moved = b.clone();
+        moved["latitude"] = json!(-6.21);
+        let second = merge(Some(&first), pairs(&[&a, &moved])).unwrap();
+        assert!(Arc::ptr_eq(&first["A"], &second["A"]));
+        assert!(!Arc::ptr_eq(&first["B"], &second["B"]));
+        assert_eq!(*second["B"], moved);
+
+        let third = merge(Some(&second), pairs(&[&a])).unwrap();
+        assert_eq!(third.keys().collect::<Vec<_>>(), ["A"]);
+        assert_eq!(merge(None, pairs(&[])), Some(Buses::new()));
     }
 
     /// enrich derives the frontend fields and keeps the upstream ones.
