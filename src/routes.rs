@@ -72,20 +72,64 @@ pub async fn routes(
     Query(params): Query<RoutesParams>,
 ) -> Result<Json<Value>, AppError> {
     let types = parse_types(params.r#type.as_deref().unwrap_or_default())?;
-    let list = route_list(&state).await?;
+    let found = routes_of(&state, &types).await?;
+    Ok(Json(json!({ "types": types, "routes": found })))
+}
+
+/// Handles GET /stops: every stop served by routes of the given types, one entry
+/// per stop_id, sorted by name. Each entry lists the codes of the routes stopping there.
+pub async fn stops(
+    State(state): State<AppState>,
+    Query(params): Query<RoutesParams>,
+) -> Result<Json<Value>, AppError> {
+    let types = parse_types(params.r#type.as_deref().unwrap_or_default())?;
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    for route in routes_of(&state, &types).await? {
+        let code = &route["route_code"];
+        for stop in route["directions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|d| d["stops"].as_array().into_iter().flatten())
+        {
+            // Stops without an id are told apart by their position instead.
+            let key = text(&stop["stop_id"])
+                .unwrap_or_else(|| format!("{},{}", stop["lat"], stop["lon"]));
+            let entry = by_id.entry(key).or_insert_with(|| {
+                let mut e = stop.clone();
+                e["routes"] = json!([]);
+                e
+            });
+            let routes = entry["routes"]
+                .as_array_mut()
+                .expect("routes is set to an array on insert");
+            if !routes.contains(code) {
+                routes.push(code.clone());
+            }
+        }
+    }
+    let mut found: Vec<Value> = by_id.into_values().collect();
+    found.sort_by_cached_key(|s| s["name"].as_str().unwrap_or_default().to_owned());
+    Ok(Json(json!({ "types": types, "stops": found })))
+}
+
+/// Normalized routes of the given types (every route when empty), sorted by route
+/// code. Routes whose detail fails or has no path are left out.
+async fn routes_of(state: &AppState, types: &[&str]) -> Result<Vec<Value>, AppError> {
+    let list = route_list(state).await?;
     let codes: Vec<String> = list
         .iter()
         .filter(|r| types.is_empty() || types.iter().any(|t| is_type(r, t)))
         .filter_map(|r| text(&r["route_short_name"]).or_else(|| text(&r["route_id"])))
         .collect();
     let mut found: Vec<Value> = stream::iter(codes)
-        .map(|code| route_detail(&state, code))
+        .map(|code| route_detail(state, code))
         .buffer_unordered(CONCURRENCY)
         .filter_map(|r| async { r })
         .collect()
         .await;
     found.sort_by_cached_key(|r| natural_key(r["route_code"].as_str().unwrap_or_default()));
-    Ok(Json(json!({ "types": types, "routes": found })))
+    Ok(found)
 }
 
 /// Splits the type parameter and maps each entry to its canonical name, ignoring
@@ -367,10 +411,15 @@ mod tests {
         assert_eq!(codes, ["1", "1A", "2", "4D", "10", "JAK.2", "JAK.10"]);
     }
 
-    /// A route the fake upstream knows, with one straight direction.
+    /// A route the fake upstream knows, with one straight direction. Every route
+    /// stops at Harmoni plus one stop of its own.
     fn detail(code: &str) -> Value {
         json!({"route": {"route_short_name": code, "route_color": "D62126"},
-               "outbound": {"trip_id": format!("{code}-R1"), "headsign": "X", "polyline": "_p~iF~ps|U_ulLnnqC"}})
+               "outbound": {"trip_id": format!("{code}-R1"), "headsign": "X", "polyline": "_p~iF~ps|U_ulLnnqC",
+                            "stops": [{"stop_id": format!("S{code}"), "stop_name": format!("Stop {code}"),
+                                       "stop_lat": -6.2, "stop_lon": 106.8},
+                                      {"stop_id": "H1", "stop_name": "Harmoni", "stop_lat": -6.1655,
+                                       "stop_lon": 106.8205, "bus_stop_type": "halte"}]}})
     }
 
     /// Builds the app against a fake upstream with BRT routes 10 and 1, Mikrotrans
@@ -463,6 +512,58 @@ mod tests {
     async fn routes_unknown_type() {
         let (app, _) = app_with_routes().await;
         let (status, body) = get(&app, "/routes?type=BRT,xyz").await;
+        assert_eq!(status, 400);
+        assert!(body["detail"].as_str().unwrap().contains("xyz"));
+    }
+
+    /// Lists the stop names in a /stops response.
+    fn stop_names(body: &Value) -> Vec<&str> {
+        body["stops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Stops of several types come once per stop_id, sorted by name, with every
+    /// route that stops there. Route 9 has no detail and is skipped.
+    #[tokio::test]
+    async fn stops_of_several_types() {
+        let (app, _) = app_with_routes().await;
+        let (status, body) = get(&app, "/stops?type=brt,%20MIKROTRANS").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["types"], json!(["BRT", "Mikrotrans"]));
+        assert_eq!(
+            stop_names(&body),
+            ["Harmoni", "Stop 1", "Stop 10", "Stop JAK.10"]
+        );
+        assert_eq!(
+            body["stops"][0],
+            json!({"stop_id": "H1", "name": "Harmoni", "lat": -6.1655, "lon": 106.8205,
+                   "type": "halte", "routes": ["1", "10", "JAK.10"]})
+        );
+        assert_eq!(body["stops"][1]["routes"], json!(["1"]));
+    }
+
+    /// No type means the stops of every route.
+    #[tokio::test]
+    async fn stops_without_type() {
+        let (app, _) = app_with_routes().await;
+        let (_, body) = get(&app, "/stops").await;
+        assert_eq!(body["types"], json!([]));
+        assert_eq!(
+            body["stops"][0]["routes"],
+            json!(["1", "10", "JAK.10", "R1"])
+        );
+        assert_eq!(body["stops"].as_array().unwrap().len(), 5);
+    }
+
+    /// An unknown type is a bad request, as on /routes.
+    #[tokio::test]
+    async fn stops_unknown_type() {
+        let (app, _) = app_with_routes().await;
+        let (status, body) = get(&app, "/stops?type=xyz").await;
         assert_eq!(status, 400);
         assert!(body["detail"].as_str().unwrap().contains("xyz"));
     }

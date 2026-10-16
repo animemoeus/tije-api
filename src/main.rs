@@ -77,6 +77,7 @@ fn app(state: AppState) -> Router {
         .route("/buses/{bus_body_no}", get(live::bus_events))
         .route("/route-types", get(routes::route_types))
         .route("/routes", get(routes::routes))
+        .route("/stops", get(routes::stops))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

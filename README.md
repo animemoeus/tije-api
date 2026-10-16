@@ -38,6 +38,7 @@ If the server can't reach the upstream, it will tell you, with a 503 and a fair 
 | GET | `/health` | Upstream connection state and live feed counters |
 | GET | `/route-types` | Every route type and how many routes it has |
 | GET | `/routes?type=` | Path and stops of every route of one or more types |
+| GET | `/stops?type=` | Every stop served by routes of one or more types |
 | WS | `/ws?routes=` | Live bus positions: one snapshot, then deltas |
 | GET | `/buses/{bus_body_no}` | Event stream that follows one bus |
 
@@ -139,6 +140,23 @@ The rules:
 - A direction without a polyline falls back to straight lines between its stops. Buses don't drive through buildings, but the drawing does.
 - A route the upstream doesn't know, or one with no path, is left out quietly.
 - The route list and each route detail are cached for an hour. The first call after a restart takes about 2 seconds for BRT and Mikrotrans together (128 routes). Every call after that is fast.
+
+### GET /stops?type=
+
+```sh
+curl "http://localhost:8000/stops?type=BRT,Mikrotrans"
+```
+
+```json
+{
+  "types": ["BRT", "Mikrotrans"],
+  "stops": [
+    {"stop_id": "H00278P", "name": "Harmoni", "lat": -6.1655, "lon": 106.8205, "type": "halte", "routes": ["1", "8", "JAK.10"]}
+  ]
+}
+```
+
+`type` works the same as on `/routes`: one or more types, comma-separated, any case, left out for every route. It's also the only parameter. The upstream has no "all stops" endpoint, so this list is built from the cached route details. A stop shows up once per `stop_id`, and `routes` lists every route code that stops there. Stops are sorted by name.
 
 ### WS /ws?routes=
 
