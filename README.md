@@ -14,7 +14,7 @@ Copy the example config:
 cp .env.example .env
 ```
 
-Then set `TJ_BASE_URL`. It is required, it has no default, and it never goes in the repo, so ask the team for it instead of grepping the git history hoping someone slipped. The other `TJ_*` settings are optional and default to whatever the Android app sends. `.env.example` lists them, including `TJ_POLL_SECONDS` (default 0.5), which sets how often the bus feed is polled while someone is watching.
+Then set `TJ_BASE_URL`. It is required, it has no default, and it never goes in the repo, so ask the team for it instead of grepping the git history hoping someone slipped. The other `TJ_*` settings are optional and default to whatever the Android app sends. `.env.example` lists them, including `TJ_POLL_SECONDS` (default 0.333, three polls a second), which sets how often the bus feed is polled while someone is watching.
 
 Start the server:
 

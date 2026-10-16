@@ -26,7 +26,7 @@ impl Settings {
         Self {
             base_url: base_url.into(),
             timeout: Duration::from_secs(15),
-            poll: Duration::from_millis(500),
+            poll: Duration::from_millis(333),
             app_version: "3.0.4".into(),
             app_os: "android".into(),
             app_os_version: "14".into(),
@@ -97,5 +97,11 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// The default poll interval gives three polls per second.
+    #[test]
+    fn default_poll_is_three_per_second() {
+        assert_eq!(Settings::new("http://x").poll, Duration::from_millis(333));
     }
 }
